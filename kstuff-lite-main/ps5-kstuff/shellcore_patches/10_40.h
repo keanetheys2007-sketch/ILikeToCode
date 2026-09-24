@@ -1,17 +1,6 @@
 #ifndef SHELLCORE_PATCHES_10_40
 #define SHELLCORE_PATCHES_10_40
 
-static const struct shellcore_fpkg_offsets shellcore_fpkg_offsets_1040 = {
-    .ppr_call = 0x75a2f7,
-    .ppr_cave = 0x17df900,
-    .ppr_cave_size = 0x700,
-    .close_plt = 0x17d6ad0,
-    .open_plt = 0x17d7c20,
-    .pread_plt = 0x17d7da0,
-    .mount_ppr_pkg_plt = 0x17da080,
-    .getpid_plt = 0x17d67e0,
-};
-
 static struct shellcore_patch shellcore_patches_1040_retail[] = {
     {0xC07DB3, "\x52\xeb\xe2", 3}, // push rdx; jmp 0xC07D98
     {0xC07D98, "\xe8\x33\xf8\xff\xff\x58\xc3", 7}, // call 0xC075D0; pop rax; ret
@@ -35,6 +24,11 @@ static struct shellcore_patch shellcore_patches_1040_retail[] = {
     {0x5d8461, "\x66\x90", 2}, // force getSceSysDirPath to take isDebuggerOrAppHomeLaunchedApp=1 path, by ArkSama
     {0xaadfa1, "\xEB", 1}, // fix trophies not unlocking in certain games
     {0xA8B053, "\xeb\x03", 2}, // disable game error message
+
+    // Allow ps4_nongame_mini launches through the three category checks.
+    {0x607C7A, "\xeb", 1}, // preLaunchCheck
+    {0x607EE2, "\xeb", 1}, // category check
+    {0x6081A9, "\xeb", 1}, // workspace category check
 
     {0x3057F0, "\x90\xe9", 2}, // PS4 Disc Installer Patch 1
     {0x30586A, "\x90\xe9", 2}, // PS5 Disc Installer Patch 1

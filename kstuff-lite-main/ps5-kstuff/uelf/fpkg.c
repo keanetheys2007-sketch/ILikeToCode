@@ -66,6 +66,7 @@ enum ppr_verify_success_abi
     PPR_VERIFY_SUCCESS_R13_STACK_158,
     PPR_VERIFY_SUCCESS_R13_STACK_150,
     PPR_VERIFY_SUCCESS_PACKED_STACK_158,
+    PPR_VERIFY_SUCCESS_PACKED_STACK_150,
 };
 
 struct ppr_profile
@@ -88,12 +89,19 @@ struct ppr_profile
  * The cleanup call deltas are kept in the same profile so a firmware cannot
  * expose only half of the interception ABI.
  *
- * Every E8 delta below was verified byte-for-byte against the matching retail
- * x86_kernel.elf. Firmware without a matching image in the local corpus is
- * deliberately omitted. No runtime kernel-text probing is performed.
+ * The matching offset header records whether each firmware was statically
+ * revalidated against retail or is still derived from a devkit image.  The E8
+ * deltas below are checked together with those offsets by
+ * tools/validate_ppr_offsets.py when a retail image is available.  No runtime
+ * kernel-text probing is performed.
  */
 static const struct ppr_profile* get_ppr_profile(void)
 {
+    /* Keep the newer profiles and offsets available for later work, but do
+     * not arm plaintext PPR interception above 11.60. */
+    if(FWVER > 0x1160)
+        return NULL;
+
     static const struct ppr_profile fw1_early = {
         0x126, 0x15a,
         R15, R14, R15, RBX, 0x16,
@@ -149,6 +157,16 @@ static const struct ppr_profile* get_ppr_profile(void)
         R13, R14, R15, RBX, 0x0a,
         PPR_VERIFY_SUCCESS_PACKED_STACK_158,
     };
+    static const struct ppr_profile fw12 = {
+        0x119, 0x149,
+        R13, R14, R15, RBX, 0x0a,
+        PPR_VERIFY_SUCCESS_PACKED_STACK_150,
+    };
+    static const struct ppr_profile fw13 = {
+        0x12b, 0x15b,
+        R13, R14, R15, RBX, 0x0a,
+        PPR_VERIFY_SUCCESS_PACKED_STACK_150,
+    };
 
     switch(FWVER)
     {
@@ -172,12 +190,18 @@ static const struct ppr_profile* get_ppr_profile(void)
         return &fw7;
     case 0x800: case 0x820: case 0x840: case 0x860:
         return &fw8;
-    case 0x900: case 0x920: case 0x940: case 0x960:
+    case 0x900: case 0x905: case 0x920: case 0x940: case 0x960:
         return &fw9;
     case 0x1000: case 0x1001: case 0x1020: case 0x1040: case 0x1060:
         return &fw10;
-    case 0x1100: case 0x1120: case 0x1140:
+    case 0x1100: case 0x1120: case 0x1140: case 0x1160:
         return &fw11;
+    case 0x1200: case 0x1202: case 0x1220: case 0x1240:
+    case 0x1260: case 0x1270:
+        return &fw12;
+    case 0x1300: case 0x1320: case 0x1340: case 0x1342:
+    case 0x1360:
+        return &fw13;
     default:
         return NULL;
     }
@@ -700,12 +724,12 @@ int control_ppr_plaintext_request(uint64_t magic, uint64_t mode,
                                   uint64_t* result)
 {
     /*
-     * "PPRPLAIN", protocol v8. No user pointer is dereferenced: WRITE carries
+     * "PPRPLAIN". No user pointer is dereferenced: WRITE carries
      * 16 snapshot bytes in R8/R9. R10 is deliberately unused because the
      * established kekcall fast snapshot ends at RAX and includes R8/R9.
      */
     *result = 0;
-    if(!get_ppr_profile() || magic != 0x505052504c41494eull)
+    if(magic != 0x505052504c41494eull)
         return EINVAL;
     if(mode == PPR_CONTROL_TRACE)
     {
@@ -740,6 +764,10 @@ int control_ppr_plaintext_request(uint64_t magic, uint64_t mode,
     if((fpkg_scope_for_thread(td) & FPKG_SCOPE_KIND_MASK)
                                       != KSTUFF_FPKG_SCOPE_PPR_MOUNT)
         return EPERM;
+    /* Mount scope tracking stays active; unsupported plaintext requests are
+     * rejected, and the ShellCore wrapper returns its mount error. */
+    if(!get_ppr_profile())
+        return EINVAL;
     if(mode == 0)
     {
         if(arg0 != PPR_PLAINTEXT_PROTOCOL_VERSION)
@@ -1468,7 +1496,7 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
          * and both completed read sizes. sm_pfs normally uses the vnode/FIH
          * context in request qwords 10/11 to read and fill a 0x1000-byte FIH
          * buffer plus a 0x5a0-byte verified superblock. Calling VFS from the
-         * debug exception is unsafe, so protocol v8 snapshots both file ranges
+         * debug exception is unsafe, so snapshots both file ranges
          * before nmount and this trap supplies the same output buffers.
          * registerMountKey indexes a global RB tree by handle alone.  The
          * emulated result therefore jumps past both key registrations and the
@@ -1591,6 +1619,27 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
             };
             _Static_assert(sizeof(fake_resp) == 32,
                            "unexpected verifyImage response layout");
+            size_t fake_resp_size = sizeof(fake_resp);
+            memcpy(req, &fake_resp, sizeof(fake_resp));
+            if(ppr_abi->verify_success_abi == PPR_VERIFY_SUCCESS_R14_R15
+            || ppr_abi->verify_success_abi
+                                      == PPR_VERIFY_SUCCESS_R13_STACK_158)
+            {
+                /*
+                 * The 1.xx-6.xx wrapper uses the old in/out request ABI.
+                 * After the mailbox returns it reads the completed FIH and
+                 * superblock sizes from dwords at request+0x4c and +0x54.
+                 * Merely returning the newer 32-byte response header leaves
+                 * the input capacity (0x3000) in the first slot and zero in
+                 * the second.  Besides reporting the wrong FIH length, that
+                 * makes the wrapper skip the superblock's movbe conversion.
+                 */
+                memcpy((uint8_t*)req + 0x4c, &fih_read_size,
+                       sizeof(uint32_t));
+                memcpy((uint8_t*)req + 0x54, &sblock_read_size,
+                       sizeof(uint32_t));
+                fake_resp_size = 0x58;
+            }
             /*
              * Recreate the generation-specific values that the skipped
              * wrapper code would have prepared, then enter its no-key success
@@ -1608,11 +1657,15 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
                                       == PPR_VERIFY_SUCCESS_R13_STACK_150)
                 success_stack_offset = -0x150;
             else if(ppr_abi->verify_success_abi
-                                      == PPR_VERIFY_SUCCESS_PACKED_STACK_158)
+                                      == PPR_VERIFY_SUCCESS_PACKED_STACK_158
+                 || ppr_abi->verify_success_abi
+                                      == PPR_VERIFY_SUCCESS_PACKED_STACK_150)
             {
-                success_stack_offset = -0x158;
+                success_stack_offset = ppr_abi->verify_success_abi
+                                      == PPR_VERIFY_SUCCESS_PACKED_STACK_158
+                                     ? -0x158 : -0x150;
                 /*
-                 * The 10.x/11.x no-key continuation loads this qword and
+                 * The 10.x-13.x no-key continuation loads this qword and
                  * publishes its upper dword as ekey (XTS) and its lower
                  * dword as skey (CMAC).  Keep that order distinct from the
                  * in-memory key-index pair used later by ppfs cleanup.
@@ -1637,7 +1690,7 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
              * fails, the stock secure-module call can still run without
              * observing a partially forged response header.
              */
-            if(copy_to_kernel(regs[RDX], &fake_resp, sizeof(fake_resp)))
+            if(copy_to_kernel(regs[RDX], req, fake_resp_size))
             {
                 (void)rollback_current_ppr_plaintext_key_pair(latch_td);
                 return 0;
@@ -1648,7 +1701,9 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
                 regs[R15] = PPR_PFS_PLAINTEXT_CMAC_HANDLE;
             }
             else if(ppr_abi->verify_success_abi
-                                      != PPR_VERIFY_SUCCESS_PACKED_STACK_158)
+                                      != PPR_VERIFY_SUCCESS_PACKED_STACK_158
+                 && ppr_abi->verify_success_abi
+                                      != PPR_VERIFY_SUCCESS_PACKED_STACK_150)
             {
                 regs[R13] = PPR_PFS_PLAINTEXT_CMAC_HANDLE;
             }

@@ -73,18 +73,18 @@ DEF(syscall_cfi_table_jmp_int3, -0xa3d130)
 DEF(cr0_load, -0x9EDBFC)
 DEF(cr0_clear_store, -0x5C28A3)
 DEF(cr0_write_ret, -0x5884C3)
-DEF(store_rax_rdi, -0xA8406E)
+DEF(store_rax_rdi, -0xAA406E)
 
 
-// PPR/fPKG port is not enabled for this firmware table.
-DEF(ppr_pfs_get_xts_index, 0)
-DEF(ppr_pfs_get_cmac_index, 0)
-DEF(ppr_pfs_get_xts_return, 0)
-DEF(ppr_pfs_get_cmac_return, 0)
-DEF(ppr_pfs_cleanup_keys, 0)
-DEF(ppr_pfs_clear_key_missing, 0)
-DEF(sceSblServiceMailbox_lr_verifyImage, 0)
-DEF(ppr_pfs_verify_image_no_key_success, 0)
+// PPR/fPKG offsets
+DEF(ppr_pfs_get_xts_index, -0x1303b0)
+DEF(ppr_pfs_get_cmac_index, -0x130250)
+DEF(ppr_pfs_get_xts_return, -0x92cb47)
+DEF(ppr_pfs_get_cmac_return, -0x92cafc)
+DEF(ppr_pfs_cleanup_keys, -0x934f80)
+DEF(ppr_pfs_clear_key_missing, -0xa1806f)
+DEF(sceSblServiceMailbox_lr_verifyImage, -0xa1950d)
+DEF(ppr_pfs_verify_image_no_key_success, -0xa191b2)
 
 // non data-relative offsets
 DEF(p_sysent, 0xA08)
