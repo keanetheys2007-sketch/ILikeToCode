@@ -1,19 +1,12 @@
 class rop {
 
     constructor(p, stack_size = 0x80000, reserved_stack = 0x10000) {
-        const primitive = (p && p.p && typeof p.p === "object") ? p.p : p;
-        this.p = primitive;
-
         this.stack_size = stack_size;
         this.reserved_stack = reserved_stack;
         this.stack_dwords = stack_size / 0x4;
         this.reserved_stack_index = this.reserved_stack / 0x4;
 
-        if (!primitive || typeof primitive.malloc !== "function") {
-            throw new TypeError("rop: primitive missing malloc() allocator");
-        }
-
-        this.stack_memory = primitive.malloc(this.stack_dwords + 0x2 + 0x200);
+        this.stack_memory = p.malloc(this.stack_dwords + 0x2 + 0x200);
         this.stack_array = this.stack_memory.backing;
         this.zeroed_stack = new Uint32Array(this.stack_dwords);
 
@@ -22,8 +15,10 @@ class rop {
         this.initial_count = 0;
         this.count = 0;
 
-        this.gadgets = primitive.gadgets;
-        this.syscalls = primitive.syscalls;
+        this.p = p;
+
+        this.gadgets = p.gadgets;
+        this.syscalls = p.syscalls;
 
         this.branches = this.return_value.add32(0x8);
         this.branches_count = 0;
@@ -57,48 +52,18 @@ class rop {
     }
 
     set_entry(index, value) {
-        let encoded = null;
-
         if (value instanceof int64) {
-            encoded = value;
-        } else if (typeof value === "number") {
-            if (!Number.isFinite(value) || !Number.isInteger(value)) {
-                throw new TypeError(`rop.set_entry: non-integer JS number value ${value}`);
+            this.stack_array[this.reserved_stack_index + index * 2] = value.low;
+            this.stack_array[this.reserved_stack_index + index * 2 + 1] = value.hi;
+        } else if (typeof (value) == 'number') {
+            this.stack_array[this.reserved_stack_index + index * 2] = value;
+            this.stack_array[this.reserved_stack_index + index * 2 + 1] = 0x0;
+            if (value > 0xFFFFFFFF) {
+                alert("you're trying to write a value exceeding 32-bits without using a int64 instance");
             }
-            encoded = new int64(value >>> 0, Math.floor(value / 0x100000000) >>> 0);
-        } else if (typeof value === "bigint") {
-            const valueNum = Number(value);
-            if (!Number.isSafeInteger(valueNum)) {
-                throw new TypeError(`rop.set_entry: BigInt exceeds safe JS integer range: ${value}`);
-            }
-            encoded = new int64(valueNum >>> 0, Math.floor(valueNum / 0x100000000) >>> 0);
-        } else if (value && typeof value === "object" && "low" in value) {
-            const tmp = value;
-            const lo = Number.isInteger(tmp.low) ? tmp.low : 0;
-            const hi = Number.isInteger(tmp.hi ?? tmp.high) ? (tmp.hi ?? tmp.high) : 0;
-            encoded = new int64(lo >>> 0, hi >>> 0);
-        } else if (typeof value === "string") {
-            const trimmed = value.trim();
-            if (/^0x[0-9a-fA-F]+$/.test(trimmed) || /^-?\d+$/.test(trimmed)) {
-                const parsed = Number(trimmed);
-                if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
-                    throw new TypeError(`rop.set_entry: could not coerce string value to integer: ${value}`);
-                }
-                encoded = new int64(parsed >>> 0, Math.floor(parsed / 0x100000000) >>> 0);
-            }
+        } else {
+            alert("You're trying to write a non number/non int64 value?");
         }
-
-        if (!encoded) {
-            const label = value === undefined ? "undefined" : value === null ? "null" : String(value);
-            const detail = value && typeof value === "object" && "constructor" in value
-                ? value.constructor && value.constructor.name ? value.constructor.name : Object.prototype.toString.call(value)
-                : typeof value;
-            console.error("rop.set_entry: invalid stack value", { value, label, type: detail });
-            throw new TypeError(`rop.set_entry: invalid stack value type (${detail}) — expected number, bigint, or int64; got ${label}`);
-        }
-
-        this.stack_array[this.reserved_stack_index + index * 2] = encoded.low;
-        this.stack_array[this.reserved_stack_index + index * 2 + 1] = encoded.hi;
     }
 
     push(value) {

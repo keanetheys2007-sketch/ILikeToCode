@@ -214,65 +214,6 @@ function readInto(dest, addr, count) {
     return dest;
 }
 
-const PRIM_GC = [];
-
-function malloc(sz, type = 4) {
-    let backing;
-    if (type === 1) {
-        backing = new Uint8Array(Math.max(0x1000, sz + 0x100));
-    } else if (type === 2) {
-        backing = new Uint16Array(Math.max(0x2000, sz + 0x100));
-    } else {
-        backing = new Uint32Array(Math.max(0x10000, sz + 0x100));
-    }
-
-    PRIM_GC.push(backing);
-    const ptr = read8(leakval(backing).add32(0x10));
-    ptr.backing = backing;
-    return ptr;
-}
-
-function mallocDump(sz) {
-    const backing = new Uint8Array(sz);
-    PRIM_GC.push(backing);
-    const ptr = read8(leakval(backing).add32(0x10));
-    ptr.backing = backing;
-    return ptr;
-}
-
-function stringify(str) {
-    const bufView = new Uint8Array(str.length + 1);
-    for (let i = 0; i < str.length; i++)
-        bufView[i] = str.charCodeAt(i) & 0xff;
-    const ptr = read8(leakval(bufView).add32(0x10));
-    ptr.backing = bufView;
-    return ptr;
-}
-
-function readstr(addr, maxlen = -1) {
-    let out = "";
-    for (let i = 0; ; i++) {
-        if (maxlen !== -1 && i >= maxlen) break;
-        const ch = read1(addr.add32(i));
-        if (ch === 0x0) break;
-        out += String.fromCharCode(ch);
-    }
-    return out;
-}
-
-function writestr(addr, str) {
-    let waddr = addr.add32(0);
-    if (typeof str === "string") {
-        for (let i = 0; i < str.length; i++) {
-            const byte = str.charCodeAt(i);
-            if (byte === 0) break;
-            write1(waddr, byte);
-            waddr = waddr.add32(0x1);
-        }
-    }
-    write1(waddr, 0x0);
-}
-
 const WORKER_BUFFER_SIZE = 0x100;
 const PAIR_IDENT_OFFSET = 0x20;
 const MAIN_IDENT_OFFSET = 0x40;
@@ -797,12 +738,7 @@ export function installWindowP(c, options) {
     const prim = {
         read1, read2, read4, read8,
         write1, write2, write4, write8,
-        leakval,
-        malloc,
-        mallocDump,
-        stringify,
-        readstr,
-        writestr
+        leakval
     };
     globalThis.p = prim;
 
