@@ -221,6 +221,35 @@ async function loadExploitModules() {
 
 loadExploitModules();
 
+// ============================================================
+// GLOBAL FAILURE CAPTURE
+// The native WebKit dialogs ("You're trying to write a non
+// number/non int64 value?", then "not enough memory space" and a
+// WebProcess crash) are emitted by the PS5's own runtime, NOT by
+// this module -- so they never reach the on-screen console. Mirror
+// them (and any uncaught JS error / promise rejection, including
+// those raised inside the WebWorker ROP path) into the console so
+// a "silent" failure leaves a visible trace we can debug from.
+// ============================================================
+function consoleTrace(tag, text) {
+    try { if (typeof log === "function") log(`[${tag}] ${text}`, "log-warn"); } catch (e) {}
+}
+window.addEventListener("error", (e) => {
+    const m = (e && e.message) ? e.message : String(e);
+    const where = (e && e.filename) ? ` @${e.filename}:${(e && e.lineno) || 0}` : "";
+    consoleTrace("WINDOW-ERROR", m + where);
+});
+window.addEventListener("unhandledrejection", (e) => {
+    const r = (e && e.reason);
+    const msg = (r && (r.message || r)) ? (r.message || String(r)) : String(r);
+    consoleTrace("UNHANDLED-PROMISE", msg);
+});
+if (window.alert) {
+    const nativeAlert = window.alert.bind(window);
+    window.alert = function (m) { consoleTrace("ALERT", String(m)); return nativeAlert(m); };
+}
+
+
 const OFFSETS_URL = "offsets/offsets.json";
 const DEFAULT_LISTENER_PORT = "9026";
 
@@ -818,6 +847,26 @@ async function initROP() {
     log(`libSceNKWebKit: 0x${libSceNKWebKitBase.toString()}`, "log-ok");
     log(`libSceLibcInternal: 0x${libSceLibcInternalBase.toString()}`, "log-ok");
     log(`libKernel: 0x${libKernelBase.toString()}`, "log-ok");
+
+    // Firmware / offsets sanity check. On a firmware mismatch the three
+    // read8() base resolutions above come back as garbage (zero / non
+    // canonical), the ROP chain then writes those bogus values and WebKit
+    // shows the "You're trying to write a non number/non int64 value?"
+    // dialog in a loop and finally dies with "not enough memory space" and
+    // crashes the whole browser. Detect it now and abort cleanly instead.
+    const plausibleBase = (b) => Number.isFinite(b.low) && Number.isFinite(b.hi)
+        && (b.low !== 0 || b.hi !== 0)
+        && b.hi > 0x0 && b.hi < 0x40000000;
+    const wkOK = plausibleBase(libSceNKWebKitBase);
+    const lkOK = plausibleBase(libKernelBase);
+    const lcOK = plausibleBase(libSceLibcInternalBase);
+    if (!(wkOK && lkOK && lcOK)
+        || libSceLibcInternalBase.low === libSceNKWebKitBase.low
+        || libKernelBase.low === libSceNKWebKitBase.low) {
+        log(`Offset table does NOT match this WebKit build (wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, lc=0x${libSceLibcInternalBase.toString()}). Aborting before ROP to avoid the WebKit OOM crash.`, "log-err");
+        throw new Error(`Offsets do not match firmware ${fwStr}; aborting before ROP (avoids WebKit OOM crash).`);
+    }
+    log(`Resolved bases pass the offset plausibility check (wk=0x${libSceNKWebKitBase.toString()}, lk=0x${libKernelBase.toString()}, lc=0x${libSceLibcInternalBase.toString()})`, "log-ok");
 
     let gadgets = {};
     for (let g in offsets.wk_gadgetmap) gadgets[g] = libSceNKWebKitBase.add32(offsets.wk_gadgetmap[g]);
