@@ -1,0 +1,4 @@
+Paste the copied console output from the jailbreak page here for debugging.
+
+This file is only a local workspace sink for manual log capture.
+The browser cannot directly write into the project folder without a server-side helper, so use the browser "Save" button to download a .txt file and then paste that text here.

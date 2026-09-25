@@ -32,6 +32,9 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 @keyframes btnWarningPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,51,79,0.25); } 50% { box-shadow: 0 0 0 10px rgba(239,51,79,0.08); } }
 #msg { color:#888; font-size:0.8rem; margin-top:14px; min-height:1.2em; text-align: center; }
 #progress { color:#00e5ff; font-size:0.75rem; margin-top:8px; min-height:1.2em; text-align: center; font-family: monospace; }
+.patch-status { margin-top: 10px; padding: 8px 12px; border: 1px solid rgba(79,127,214,0.45); background: rgba(79,127,214,0.12); color: #dfeaff; border-radius: 10px; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.04em; text-align: center; max-width: 720px; width: min(92vw, 720px); }
+.patch-status.warning { border-color: rgba(255,171,0,0.6); background: rgba(255,171,0,0.08); color: #ffd574; }
+.patch-status.ok { border-color: rgba(22,198,12,0.7); background: rgba(22,198,12,0.08); color: #9cf9a5; }
 .btn-group { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
 .terminal-panel { width: min(720px, 92vw); background: rgba(9, 11, 17, 0.9); border: 1px solid #2a2a35; border-radius: 12px; margin-top: 20px; overflow: hidden; box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
 .terminal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; background: rgba(22, 29, 38, 0.9); border-bottom: 1px solid #2a2a35; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: #8a8a9e; }
@@ -139,11 +142,13 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 </div>
 <div id="msg"></div>
 <div id="progress"></div>
+<div id="patch-status" class="patch-status">WebKit patch status: checking…</div>
 <div class="terminal-panel" id="terminal-panel">
     <div class="terminal-header">
         <span>Console</span>
         <div class="terminal-actions">
             <button class="terminal-action" id="copy-log" type="button">Copy</button>
+            <button class="terminal-action" id="save-log" type="button">Save</button>
             <button class="terminal-action" id="clear-log" type="button">Clear</button>
         </div>
     </div>
@@ -233,11 +238,35 @@ const payloadsStatus = document.getElementById("payloads-status");
 const cat = document.getElementById("cat");
 const clearLogBtn = document.getElementById("clear-log");
 const copyLogBtn = document.getElementById("copy-log");
+const saveLogBtn = document.getElementById("save-log");
+const patchStatusEl = document.getElementById("patch-status");
 
 if (clearLogBtn) {
     clearLogBtn.addEventListener("click", () => {
         if (logEl) logEl.innerHTML = "";
     });
+}
+
+function updatePatchStatus() {
+    if (!patchStatusEl) return;
+
+    const fwStr = fw || "unknown";
+    const knownPatch = fw && Object.prototype.hasOwnProperty.call(FIRMWARE_OFFSETS, fwStr);
+
+    if (!fw) {
+        patchStatusEl.textContent = "WebKit patch status: browser is not on PS5; demo mode only.";
+        patchStatusEl.className = "patch-status warning";
+        return;
+    }
+
+    if (knownPatch) {
+        patchStatusEl.textContent = `WebKit patch status: PS5 ${fwStr} matches a known 13.x WebKit patch profile.`;
+        patchStatusEl.className = "patch-status ok";
+        return;
+    }
+
+    patchStatusEl.textContent = `WebKit patch status: PS5 ${fwStr} looks newer or less common; offset matching may need a fresh profile.`;
+    patchStatusEl.className = "patch-status warning";
 }
 
 async function copyConsoleLog() {
@@ -272,7 +301,35 @@ async function copyConsoleLog() {
     }
 }
 
+async function saveConsoleLogToFile() {
+    if (!logEl || !saveLogBtn) return;
+
+    const text = Array.from(logEl.querySelectorAll(".log-line"))
+        .map(line => line.textContent || "")
+        .join("\n") || "Console log is empty";
+
+    try {
+        const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        const dateStamp = new Date().toISOString().replace(/[:.]/g, "-");
+        link.href = url;
+        link.download = `webkit-console-${dateStamp}.txt`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        saveLogBtn.textContent = "Saved";
+        setTimeout(() => { saveLogBtn.textContent = "Save"; }, 1500);
+    } catch (err) {
+        saveLogBtn.textContent = "Failed";
+        setTimeout(() => { saveLogBtn.textContent = "Save"; }, 2000);
+        msg.textContent = `Unable to save console log: ${err.message}`;
+    }
+}
+
 if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
+if (saveLogBtn) saveLogBtn.addEventListener("click", saveConsoleLogToFile);
 
 const BUILTIN_PAYLOADS = [
     { file: "kstuff.elf", name: "Kstuff (Kernel Exploit)", desc: "Kernel exploit up to 13.60 — fpkg, homebrew, debug", icon: "🔓", color: "#16c60c", port: 9020 },
@@ -411,12 +468,12 @@ fetch(OFFSETS_URL, { cache: "no-store" })
     .then(function (r) { if (!r.ok) return fetch("offsets.json", { cache: "no-store" }); return r; })
     .then(function (res) { if (!res.ok) throw new Error("offsets fetch failed"); return res.json(); })
     .then(function (data) {
-        if (!fw) { msg.innerHTML = `Demo mode (<b style="color: #ffffff; font-weight: bold;">Standard Browser</b>)`; const keys = Object.keys(data); if (keys.length > 0) entry = data[keys[0]]; else entry = { hc: ["0x1e0d8", "0x1e320", "0x1f368"], gd: "0x1d11a", nt: "0x4740", gps: "0x34f57b8", gpe: "0x1b280", cls: "0x34f57a8", cle: "0x26e70", ers: "0x34f57b0", ere: "0xf340" }; jailbreak.classList.remove("disabled"); renderPayloadList(); log("Offsets loaded in demo mode", "log-info"); return; }
+        if (!fw) { msg.innerHTML = `Demo mode (<b style="color: #ffffff; font-weight: bold;">Standard Browser</b>)`; const keys = Object.keys(data); if (keys.length > 0) entry = data[keys[0]]; else entry = { hc: ["0x1e0d8", "0x1e320", "0x1f368"], gd: "0x1d11a", nt: "0x4740", gps: "0x34f57b8", gpe: "0x1b280", cls: "0x34f57a8", cle: "0x26e70", ers: "0x34f57b0", ere: "0xf340" }; jailbreak.classList.remove("disabled"); renderPayloadList(); updatePatchStatus(); log("Offsets loaded in demo mode", "log-info"); return; }
         entry = data[fw];
-        if (entry) { msg.innerHTML = `firmware <b style="color: #ffffff; font-weight: bold;">${fw}</b> detected & supported`; jailbreak.classList.remove("disabled"); renderPayloadList(); log(`Offsets loaded for firmware ${fw}`, "log-ok"); return; }
+        if (entry) { msg.innerHTML = `firmware <b style="color: #ffffff; font-weight: bold;">${fw}</b> detected & supported`; jailbreak.classList.remove("disabled"); renderPayloadList(); updatePatchStatus(); log(`Offsets loaded for firmware ${fw}`, "log-ok"); return; }
         const near = nearest(data, fw);
-        if (near) { entry = data[near]; msg.innerHTML = `<b style="color: #ffffff; font-weight: bold;">${fw}</b>: no exact offsets, trying <b style="color: #ffffff; font-weight: bold;">${near}</b> (unverified)`; jailbreak.classList.remove("disabled"); renderPayloadList(); log(`Firmware ${fw} not exact match; using closest profile ${near}`, "log-warn"); }
-        else { msg.innerHTML = `firmware <b style="color: #ffffff; font-weight: bold;">${fw}</b> not supported`; log(`Firmware ${fw} is not supported`, "log-err"); }
+        if (near) { entry = data[near]; msg.innerHTML = `<b style="color: #ffffff; font-weight: bold;">${fw}</b>: no exact offsets, trying <b style="color: #ffffff; font-weight: bold;">${near}</b> (unverified)`; jailbreak.classList.remove("disabled"); renderPayloadList(); updatePatchStatus(); log(`Firmware ${fw} not exact match; using closest profile ${near}`, "log-warn"); }
+        else { msg.innerHTML = `firmware <b style="color: #ffffff; font-weight: bold;">${fw}</b> not supported`; updatePatchStatus(); log(`Firmware ${fw} is not supported`, "log-err"); }
     })
     .catch(function () { msg.textContent = "failed to load offsets (demo fallback active)"; entry = { hc: ["0x1e0d8", "0x1e320", "0x1f368"], gd: "0x1d11a", nt: "0x4740", gps: "0x34f57b8", gpe: "0x1b280", cls: "0x34f57a8", cle: "0x26e70", ers: "0x34f57b0", ere: "0xf340" }; jailbreak.classList.remove("disabled"); renderPayloadList(); log("Offsets fetch failed, using demo fallback offsets", "log-warn"); });
 
