@@ -35,8 +35,9 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 .btn-group { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
 .terminal-panel { width: min(720px, 92vw); background: rgba(9, 11, 17, 0.9); border: 1px solid #2a2a35; border-radius: 12px; margin-top: 20px; overflow: hidden; box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
 .terminal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; background: rgba(22, 29, 38, 0.9); border-bottom: 1px solid #2a2a35; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: #8a8a9e; }
-.terminal-clear { background: #202125; color: #e6edf3; border: 1px solid #3a3a4d; border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; }
-.terminal-clear:hover { background: #2a2a35; }
+.terminal-actions { display: flex; gap: 8px; }
+.terminal-action { background: #202125; color: #e6edf3; border: 1px solid #3a3a4d; border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; }
+.terminal-action:hover { background: #2a2a35; }
 #log {
     display: block;
     color: #5a5a5a;
@@ -141,7 +142,10 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 <div class="terminal-panel" id="terminal-panel">
     <div class="terminal-header">
         <span>Console</span>
-        <button class="terminal-clear" id="clear-log" type="button">Clear</button>
+        <div class="terminal-actions">
+            <button class="terminal-action" id="copy-log" type="button">Copy</button>
+            <button class="terminal-action" id="clear-log" type="button">Clear</button>
+        </div>
     </div>
     <div id="log" aria-live="polite"></div>
 </div>
@@ -228,12 +232,47 @@ const jailbreakStage = document.getElementById("jailbreak-stage");
 const payloadsStatus = document.getElementById("payloads-status");
 const cat = document.getElementById("cat");
 const clearLogBtn = document.getElementById("clear-log");
+const copyLogBtn = document.getElementById("copy-log");
 
 if (clearLogBtn) {
     clearLogBtn.addEventListener("click", () => {
         if (logEl) logEl.innerHTML = "";
     });
 }
+
+async function copyConsoleLog() {
+    if (!logEl || !copyLogBtn) return;
+
+    const text = Array.from(logEl.querySelectorAll(".log-line"))
+        .map(line => line.textContent || "")
+        .join("\n");
+
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+        } else {
+            const textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.setAttribute("readonly", "");
+            textArea.style.position = "fixed";
+            textArea.style.opacity = "0";
+            document.body.appendChild(textArea);
+            textArea.select();
+            const copied = document.execCommand("copy");
+            textArea.remove();
+            if (!copied) throw new Error("Clipboard copy was not available");
+        }
+
+        copyLogBtn.textContent = "Copied!";
+        setTimeout(() => { copyLogBtn.textContent = "Copy"; }, 1500);
+    } catch (err) {
+        copyLogBtn.textContent = "Copy failed";
+        setTimeout(() => { copyLogBtn.textContent = "Copy"; }, 2000);
+        msg.textContent = `Unable to copy console: ${err.message}`;
+    }
+}
+
+if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
 
 const BUILTIN_PAYLOADS = [
     { file: "kstuff.elf", name: "Kstuff (Kernel Exploit)", desc: "Kernel exploit up to 13.60 — fpkg, homebrew, debug", icon: "🔓", color: "#16c60c", port: 9020 },
