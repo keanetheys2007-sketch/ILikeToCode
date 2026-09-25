@@ -303,6 +303,14 @@ function giveUp(reason) {
     settleResolve = null;
     settleReject = null;
     running = false;
+    // Hand the attempt's memory back before rejecting. This path used to keep
+    // every buffer alive: the 9,000,000-slot carrier (~72 MB), the 512 x 64 KB
+    // drain (~32 MB), the 65k filler graph, and the SSV graph still owned by
+    // the history entry. A caller that retries in the same page -- or simply
+    // presses the button again -- then allocates a second full set on top and
+    // the PS5 WebProcess dies with "not enough system memory".
+    // scheduleSafeRetry() has always released here; the give-up path did not.
+    releaseAttemptAllocations();
     if (reject !== null)
         reject(new Error(`core: gave up after ${attemptNumber} attempts (${reason})`));
 }

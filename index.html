@@ -182,7 +182,7 @@ async function loadExploitModules() {
         const modInt64 = await import('./slopkit-main/slopkit/int64.js');
         int64 = modInt64.int64;
         
-        const modCore = await import('./slopkit-main/slopkit/core.js?v=final');
+        const modCore = await import('./slopkit-main/slopkit/core.js?v=ktech2');
         establishPrimitive = modCore.establishPrimitive;
         releaseFakeCell = modCore.releaseFakeCell;
         fakeCellReleased = modCore.fakeCellReleased;
@@ -194,7 +194,7 @@ async function loadExploitModules() {
         plausibleAddress = modCore.plausibleAddress;
         plausibleCell = modCore.plausibleCell;
         
-        const modMem = await import('./slopkit-main/slopkit/mem.js?v=final');
+        const modMem = await import('./slopkit-main/slopkit/mem.js?v=ktech2');
         installWindowP = modMem.installWindowP;
         read1 = modMem.read1;
         read2 = modMem.read2;
@@ -400,6 +400,15 @@ const BUILTIN_PAYLOADS = [
     { file: "PLK.elf", name: "PLK (PS5Link)", desc: "PS5Link server for app debugging", icon: "🔗", color: "#f472b6", port: 9025 },
     { file: "shadowmountplus.elf", name: "ShadowMount+", desc: "Mount games/backups from USB/network", icon: "💾", color: "#fbbf24", port: 9027 },
 ];
+
+// How many times core.js may retry the (inherently probabilistic) SSV
+// placement before giving up. It used to be 1, which turned a routine
+// "SSV-PLACEMENT-MISS / Unable to deserialize data" into a hard failure --
+// core.js explicitly classifies that as retrySafe and wants to try again.
+// The validated slopkit pages use 8; 6 keeps a useful margin without letting a
+// run hold too many attempts. Memory is bounded because core.js now releases
+// each attempt's ~110 MB before retrying and before giving up.
+const EXPLOIT_ATTEMPTS = 6;
 
 let exploitState = {
     stage: "idle",
@@ -788,7 +797,7 @@ async function runWebKitUAF(onProgress) {
                 onEvent: (tag, detail) => {
                     log(`${tag}: ${detail}`, tag.includes("FAIL") || tag.includes("THREW") || tag.includes("ERROR") ? "log-err" : "log-info");
                 },
-                maxAttempts: 1,
+                maxAttempts: EXPLOIT_ATTEMPTS,
                 beforeCriticalLoad: () => {}
             }).then(carrier => {
                 installWindowP(carrier, { promote: true, onEvent: (tag, detail) => {
@@ -796,7 +805,7 @@ async function runWebKitUAF(onProgress) {
                 } });
                 exploitState.p = window.p;
                 log("WebKit arbitrary R/W established!", "log-ok");
-                log("Single-shot exploit mode active: retry loops are disabled to avoid browser memory exhaustion.", "log-warn");
+                log(`Primitive established on attempt ${carrier.attempts}/${EXPLOIT_ATTEMPTS}.`, "log-ok");
                 onProgress?.("WebKit UAF complete. Building ROP chain...");
                 resolve();
             }).catch(err => {
