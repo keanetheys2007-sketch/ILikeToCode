@@ -234,9 +234,34 @@ async function loadExploitModules() {
 
         exploitModulesLoaded = true;
         log("Exploit modules loaded successfully", "log-ok");
+        // Allocate the ROP worker thread now, while the page is still small.
+        // See ensureRopWorker(): spawning it after the exploit has churned
+        // through its graphs is what fails with "not enough system memory".
+        ensureRopWorker();
+        log(ropWorker ? "rop_slave worker pre-spawned" : "rop_slave worker NOT pre-spawned", "log-ok");
     } catch (err) {
         log(`Module load failed (demo mode): ${err.message}`, "log-warn");
         exploitModulesLoaded = false;
+    }
+}
+
+// The ROP stage hijacks a Worker thread. Creating that thread is the single
+// most expensive allocation the run makes, and on the PS5 it fails with
+// "not enough system memory space" if the page is already carrying the
+// exploit's garbage: mem.js/core.js never spawn a worker of their own, but
+// this page is a full UI while the validated slopkit run happens in the bare
+// poops.html. So the thread is spawned up front, while the page is still
+// small, and reused later. ensureRopWorker() does not await the first reply,
+// so the allocation happens at load time and the handshake on first use.
+let ropWorker = null;
+
+function ensureRopWorker() {
+    if (ropWorker !== null) return;
+    try {
+        ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=ktech2");
+    } catch (err) {
+        ropWorker = null;
+        log(`rop_slave worker could not be spawned: ${err.message}`, "log-warn");
     }
 }
 
@@ -985,7 +1010,8 @@ async function initROP() {
     // new Worker every time but then re-scanned the thread list, which picked
     // up the stale already-hijacked thread and made the second chain fail to
     // find its fingerprint (and leave that thread wedged).
-    let ropWorker = null;
+    // ropWorker itself lives at module scope so it can be spawned BEFORE the
+    // exploit allocates its ~110 MB (see ensureRopWorker).
     let ropWorkerStack = null;
     let ropReturnSlot = null;
 
@@ -1050,11 +1076,14 @@ async function initROP() {
         const noReturn = !!(opts && opts.noReturn);
 
         if (!ropWorker) {
-            log("ROP: spawning rop_slave worker (new thread + heap)...", "log-info");
-            ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=ktech2");
-            await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
-            log("ROP: worker primed and idle", "log-info");
+            // Normally already spawned at page load (see ensureRopWorker);
+            // this is only the fallback if that early spawn failed.
+            log("ROP: rop_slave worker missing, spawning it now...", "log-warn");
+            ensureRopWorker();
         }
+        if (!ropWorker) throw new Error("could not spawn the rop_slave worker");
+        await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
+        log("ROP: worker primed and idle", "log-info");
 
         if (!ropReturnSlot) {
             ropWorkerStack = null;
