@@ -360,6 +360,30 @@ function releaseAttemptAllocations() {
     if (typeof globalThis.gc === "function") {
         try { globalThis.gc(); } catch { }
     }
+    forceReclaim();
+}
+
+// JSC exposes no gc() on the PS5, so dropping the references above frees
+// nothing until the collector happens to run -- and between attempts the only
+// new allocations are the next attempt's, so without help each retry stacks
+// another ~104 MB (72 MB carrier + 32 MB drain) on top of the previous one.
+// That is the "repeatedly tries to organize the memory structure, then runs
+// out of system memory" failure.
+//
+// Allocation pressure is the only lever available: churning a small buffer
+// makes each fresh allocation a GC candidate, and releasing the previous
+// buffer gives the collector something to reclaim. Deliberately bounded to
+// 8 MB per round / 6 rounds so it can never itself be what exhausts the heap.
+function forceReclaim(rounds = 6, blockBytes = 256 * 1024, perRound = 32) {
+    for (let i = 0; i < rounds; i++) {
+        const scratch = [];
+        try {
+            for (let j = 0; j < perRound; j++) scratch.push(new Uint8Array(blockBytes));
+        } catch (e) {
+            // Allocation refused -- that is a collection point.
+        }
+        scratch.length = 0;
+    }
 }
 
 function scheduleSafeRetry(reason) {

@@ -429,11 +429,14 @@ const BUILTIN_PAYLOADS = [
 // How many times core.js may retry the (inherently probabilistic) SSV
 // placement before giving up. It used to be 1, which turned a routine
 // "SSV-PLACEMENT-MISS / Unable to deserialize data" into a hard failure --
-// core.js explicitly classifies that as retrySafe and wants to try again.
-// The validated slopkit pages use 8; 6 keeps a useful margin without letting a
-// run hold too many attempts. Memory is bounded because core.js now releases
-// each attempt's ~110 MB before retrying and before giving up.
-const EXPLOIT_ATTEMPTS = 6;
+// core.js classifies that as retrySafe and wants to try again.
+//
+// It was then set to 6, which was wrong in the other direction: each attempt
+// allocates ~104 MB (72 MB carrier + 32 MB drain) and JSC exposes no gc() on
+// the PS5, so extra retries stack memory and thrash the collector into
+// "not enough system memory". poops.html states the real rate -- "placement
+// is ~1 attempt in 3" -- so 3 is the value that matches the geometry.
+const EXPLOIT_ATTEMPTS = 3;
 
 let exploitState = {
     stage: "idle",
@@ -860,10 +863,20 @@ async function settleMemoryBeforeROP(ms = 800) {
     try {
         if (typeof globalThis.gc === "function") { globalThis.gc(); gced = true; }
     } catch (e) { /* not exposed on PS5 WebKit; the yield below is all we get */ }
+    // Same trick core.js now uses between attempts: churn a bounded amount of
+    // small buffers so JSC collects the ~119 MB the exploit dropped. Without
+    // this the freed graphs simply stay resident.
+    try {
+        for (let round = 0; round < 6; round++) {
+            const scratch = [];
+            for (let j = 0; j < 32; j++) scratch.push(new Uint8Array(256 * 1024));
+            scratch.length = 0;
+        }
+    } catch (e) { /* refused allocation == collection point */ }
     const rounds = 8;
     for (let i = 0; i < rounds; i++) await sleep(ms / rounds);
     log(`memory settled for ${ms}ms before the ROP stage `
-        + `(explicit gc: ${gced ? "yes" : "not exposed"})`, "log-info");
+        + `(explicit gc: ${gced ? "yes" : "not exposed"}, churned for reclaim)`, "log-info");
 }
 
 // Read-only walk of the kernel thread list, logged as a diagnostic.
