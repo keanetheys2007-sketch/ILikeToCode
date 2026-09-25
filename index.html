@@ -1086,9 +1086,18 @@ async function initROP() {
 
 async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     log("Loading elfldr-ps5-1360.elf via ROP...", "log-info");
-    const res = await fetch("payloads/elfldr-ps5-1360.elf");
-    if (!res.ok) throw new Error("Failed to fetch elfldr");
+    const res = await fetch("payloads/elfldr-ps5-1360.elf", { cache: "no-store" });
+    if (!res.ok) throw new Error(`Failed to fetch elfldr: HTTP ${res.status}`);
     const elfData = new Uint8Array(await res.arrayBuffer());
+    // Log what actually arrived, so a bad body is obvious from the console
+    // instead of surfacing as a confusing parse error three lines further down.
+    const head = [];
+    for (let i = 0; i < Math.min(8, elfData.length); i++) {
+        head.push(elfData[i].toString(16).padStart(2, "0"));
+    }
+    log(`elfldr fetched: ${elfData.length} bytes, ${res.headers.get("content-type") || "?"}, `
+        + `first bytes ${head.join("")}`, "log-info");
+    if (elfData.length < 0x40) throw new Error(`elfldr: short read (${elfData.length} bytes)`);
 
     const PAGE = 0x4000;
     const PROT_RWX = 0x7, PROT_RW = 0x3;
@@ -1102,7 +1111,19 @@ async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     // jumping to the mapping base -- what this used to do -- lands on the
     // \x7fELF header, not on code.
     const dv = new DataView(elfData.buffer, elfData.byteOffset, elfData.byteLength);
-    if (dv.getUint32(0, false) !== 0x464C457F) throw new Error("elfldr: not an ELF file");
+    // The first four bytes are 7F 45 4C 46. A BIG-endian read of those bytes is
+    // 0x7F454C46 -- comparing against the byte-reversed 0x464C457F (which is only
+    // correct for a little-endian read) rejects every real ELF.
+    if (dv.getUint32(0, false) !== 0x7F454C46) {
+        const head = [];
+        for (let i = 0; i < Math.min(16, elfData.length); i++) {
+            head.push(elfData[i].toString(16).padStart(2, "0"));
+        }
+        throw new Error(`elfldr: not an ELF file (got ${elfData.length} bytes, `
+            + `magic ${head.join("")})`);
+    }
+    if (dv.getUint8(4) !== 2 || dv.getUint8(5) !== 1)
+        throw new Error("elfldr: not a little-endian 64-bit ELF");
     const eType = dv.getUint16(16, true);
     const eEntry = dv.getUint32(24, true);
     const ePhoff = dv.getUint32(32, true);
