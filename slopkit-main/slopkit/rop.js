@@ -1,12 +1,19 @@
 class rop {
 
     constructor(p, stack_size = 0x80000, reserved_stack = 0x10000) {
+        const primitive = (p && p.p && typeof p.p === "object") ? p.p : p;
+        this.p = primitive;
+
         this.stack_size = stack_size;
         this.reserved_stack = reserved_stack;
         this.stack_dwords = stack_size / 0x4;
         this.reserved_stack_index = this.reserved_stack / 0x4;
 
-        this.stack_memory = p.malloc(this.stack_dwords + 0x2 + 0x200);
+        if (!primitive || typeof primitive.malloc !== "function") {
+            throw new TypeError("rop: primitive missing malloc() allocator");
+        }
+
+        this.stack_memory = primitive.malloc(this.stack_dwords + 0x2 + 0x200);
         this.stack_array = this.stack_memory.backing;
         this.zeroed_stack = new Uint32Array(this.stack_dwords);
 
@@ -15,10 +22,8 @@ class rop {
         this.initial_count = 0;
         this.count = 0;
 
-        this.p = p;
-
-        this.gadgets = p.gadgets;
-        this.syscalls = p.syscalls;
+        this.gadgets = primitive.gadgets;
+        this.syscalls = primitive.syscalls;
 
         this.branches = this.return_value.add32(0x8);
         this.branches_count = 0;
