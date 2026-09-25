@@ -173,7 +173,13 @@ let SYS;
 
 async function loadExploitModules() {
     try {
-        const modInt64 = await import('./slopkit-main/slopkit/int64.js?v=final');
+        // Import int64 through the SAME specifier mem.js uses. It used to be
+        // "?v=final" here, which made the page load two separate copies of
+        // int64.js; each copy re-assigns globalThis.int64, so rop.js compared
+        // addresses built by one copy against the other copy's constructor and
+        // every gadget came back as "not an int64". Keep the specifiers
+        // identical everywhere so there is only one int64 in the page.
+        const modInt64 = await import('./slopkit-main/slopkit/int64.js');
         int64 = modInt64.int64;
         
         const modCore = await import('./slopkit-main/slopkit/core.js?v=final');
@@ -203,14 +209,29 @@ async function loadExploitModules() {
         toI64 = modMem.toI64;
         addrNumber = modMem.addrNumber;
         
-        const modRop = await import('./slopkit-main/slopkit/rop.js?v=final');
+        // NOTE the cache-buster: a constant "?v=final" URL never changes, so the
+        // PS5 browser happily keeps serving a STALE rop.js from cache (its
+        // stack-trace line numbers stop matching this file, which is how you
+        // notice). Bump it whenever rop.js is edited.
+        const modRop = await import('./slopkit-main/slopkit/rop.js?v=ktech2');
         rop = modRop.rop;
         worker_rop = modRop.worker_rop;
         thread_rop = modRop.thread_rop;
-        
-        const modSyscalls = await import('./slopkit-main/slopkit/syscalls.js?v=final');
+
+        const modSyscalls = await import('./slopkit-main/slopkit/syscalls.js?v=ktech2');
         SYS = modSyscalls.SYS;
-        
+
+        // Two live copies of int64.js in one page make `instanceof int64`
+        // answer false for perfectly valid addresses, which used to surface as
+        // "You're trying to write a non number/non int64 value?" on every
+        // gadget. All specifiers now resolve to one copy; prove it.
+        if (globalThis.int64 !== int64) {
+            log("int64: two constructors in the page -- a '?v=' query on an "
+                + "int64.js import creates a second copy and breaks instanceof", "log-err");
+        } else {
+            log("int64 identity OK (single constructor in page)", "log-ok");
+        }
+
         exploitModulesLoaded = true;
         log("Exploit modules loaded successfully", "log-ok");
     } catch (err) {
@@ -1002,7 +1023,7 @@ async function initROP() {
         const noReturn = !!(opts && opts.noReturn);
 
         if (!ropWorker) {
-            ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=final");
+            ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=ktech2");
             await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
         }
 

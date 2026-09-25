@@ -53,9 +53,17 @@ class rop {
 
     set_entry(index, value) {
         const base = this.reserved_stack_index + index * 2;
-        if (value instanceof int64) {
-            this.stack_array[base] = value.low;
-            this.stack_array[base + 1] = value.hi;
+        // Duck-type the 64-bit values instead of `value instanceof int64`.
+        // A page can easily end up with two live copies of int64.js -- it is
+        // imported both as "./int64.js" (mem.js, poops.html) and as
+        // "./int64.js?v=final" (index.html) -- and each copy re-assigns
+        // globalThis.int64, so `instanceof` compares against whichever copy
+        // happened to evaluate last and rejects perfectly good addresses.
+        // mem.js's toI64() already falls back to the same shape check.
+        if (value !== null && typeof value === "object"
+            && typeof value.low === "number" && typeof value.hi === "number") {
+            this.stack_array[base] = value.low >>> 0;
+            this.stack_array[base + 1] = value.hi >>> 0;
         } else if (typeof (value) == 'number') {
             // The ROP stack is a Uint32Array, so only the low 32 bits of a
             // push survive. Refuse anything that cannot be represented
