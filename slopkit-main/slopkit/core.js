@@ -310,6 +310,9 @@ function giveUp(reason) {
     // presses the button again -- then allocates a second full set on top and
     // the PS5 WebProcess dies with "not enough system memory".
     // scheduleSafeRetry() has always released here; the give-up path did not.
+    // releaseAttemptAllocations() nulls the graphs, clears the history entry
+    // and then churns for reclaim, so it is the whole cleanup -- do not
+    // replace it with a bare forceReclaim(), which frees nothing.
     releaseAttemptAllocations();
     if (reject !== null)
         reject(new Error(`core: gave up after ${attemptNumber} attempts (${reason})`));
@@ -360,7 +363,9 @@ function releaseAttemptAllocations() {
     if (typeof globalThis.gc === "function") {
         try { globalThis.gc(); } catch { }
     }
-    forceReclaim();
+    const headroom = forceReclaim();
+    emit("RECLAIM-AFTER-RELEASE", `free-after-drop=${(headroom / 1048576).toFixed(1)}MB`
+        + `-attempt=${attemptNumber}`);
 }
 
 // JSC exposes no gc() on the PS5, so dropping the references above frees
@@ -372,18 +377,27 @@ function releaseAttemptAllocations() {
 //
 // Allocation pressure is the only lever available: churning a small buffer
 // makes each fresh allocation a GC candidate, and releasing the previous
-// buffer gives the collector something to reclaim. Deliberately bounded to
-// 8 MB per round / 6 rounds so it can never itself be what exhausts the heap.
-function forceReclaim(rounds = 6, blockBytes = 256 * 1024, perRound = 32) {
+// buffer gives the collector something to reclaim.
+//
+// The headroom it managed to allocate afterwards is the direct measurement we
+// never had: if it is ~48 MB every time, reclaim works and the attempt count
+// can go back up; if it stays near zero, JSC is not collecting the dropped
+// attempt and extra retries are what cause the OOM.
+function forceReclaim(rounds = 8, blockBytes = 256 * 1024, perRound = 32) {
+    let headroom = 0;
     for (let i = 0; i < rounds; i++) {
         const scratch = [];
         try {
-            for (let j = 0; j < perRound; j++) scratch.push(new Uint8Array(blockBytes));
+            for (let j = 0; j < perRound; j++) {
+                scratch.push(new Uint8Array(blockBytes));
+                headroom += blockBytes;
+            }
         } catch (e) {
             // Allocation refused -- that is a collection point.
         }
         scratch.length = 0;
     }
+    return headroom;
 }
 
 function scheduleSafeRetry(reason) {

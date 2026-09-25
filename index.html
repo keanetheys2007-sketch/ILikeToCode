@@ -97,18 +97,19 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 .stage-badge.idle { background: #3a3a4d; color: #8a8a9e; }
 #log {
     color: #5a5a5a;
-    font-size: 11px;
+    font-size: 12px;
     font-family: "Consolas", monospace;
-    max-width: 92vw;
+    max-width: 100%;
     overflow: hidden;
     text-align: left;
     line-height: 1.35;
     margin-top: 10px;
-    max-height: 200px;
+    max-height: 60vh;
+    min-height: 240px;
     overflow-y: auto;
     overflow-x: hidden;
     width: 100%;
-    max-width: 500px;
+    max-width: 860px;
     scrollbar-color: rgba(255,255,255,0.22) rgba(0,0,0,0.18);
     scrollbar-width: thin;
 }
@@ -431,12 +432,17 @@ const BUILTIN_PAYLOADS = [
 // "SSV-PLACEMENT-MISS / Unable to deserialize data" into a hard failure --
 // core.js classifies that as retrySafe and wants to try again.
 //
-// It was then set to 6, which was wrong in the other direction: each attempt
-// allocates ~104 MB (72 MB carrier + 32 MB drain) and JSC exposes no gc() on
-// the PS5, so extra retries stack memory and thrash the collector into
-// "not enough system memory". poops.html states the real rate -- "placement
-// is ~1 attempt in 3" -- so 3 is the value that matches the geometry.
-const EXPLOIT_ATTEMPTS = 3;
+// It was then set too high (6), which is wrong in the other direction: each
+// attempt allocates ~104 MB (72 MB carrier + 32 MB drain) and JSC exposes no
+// gc() on the PS5, so retries stack memory and thrash the collector into
+// "not enough system memory". poops.html states the real placement rate --
+// "placement is ~1 attempt in 3" -- so P(all miss) is (2/3)^N:
+//   3 -> 30%,  5 -> 13%,  6 -> 9%
+// 5 is the point where misses are unlikely without piling on memory. If the
+// RECLAIM-AFTER-RELEASE lines show ~48 MB of headroom, JSC really is
+// collecting and this can go higher; if they show ~0 MB, it is not, and the
+// count must stay low.
+const EXPLOIT_ATTEMPTS = 5;
 
 let exploitState = {
     stage: "idle",
