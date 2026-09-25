@@ -52,17 +52,34 @@ class rop {
     }
 
     set_entry(index, value) {
+        const base = this.reserved_stack_index + index * 2;
         if (value instanceof int64) {
-            this.stack_array[this.reserved_stack_index + index * 2] = value.low;
-            this.stack_array[this.reserved_stack_index + index * 2 + 1] = value.hi;
+            this.stack_array[base] = value.low;
+            this.stack_array[base + 1] = value.hi;
         } else if (typeof (value) == 'number') {
-            this.stack_array[this.reserved_stack_index + index * 2] = value;
-            this.stack_array[this.reserved_stack_index + index * 2 + 1] = 0x0;
-            if (value > 0xFFFFFFFF) {
-                alert("you're trying to write a value exceeding 32-bits without using a int64 instance");
+            // The ROP stack is a Uint32Array, so only the low 32 bits of a
+            // push survive. Refuse anything that cannot be represented
+            // faithfully: a silent truncation here sends the chain into
+            // garbage and costs you a crashed WebProcess instead of an error.
+            if (!Number.isFinite(value) || Math.floor(value) !== value) {
+                throw new TypeError(`rop.set_entry(${index}): ${value} is not an integer`);
             }
+            if (value > 0xFFFFFFFF || value < -0x80000000) {
+                throw new RangeError(
+                    `rop.set_entry(${index}): ${value} does not fit in 32 bits -- `
+                    + "pass an int64 instead");
+            }
+            this.stack_array[base] = value >>> 0;
+            this.stack_array[base + 1] = 0x0;
         } else {
-            alert("You're trying to write a non number/non int64 value?");
+            // Previously this only called alert() and returned, so the chain
+            // kept being built on top of a hole and the WebProcess was left to
+            // die later with "not enough memory space". Throwing aborts the
+            // stage cleanly and carries the offending entry to the console.
+            throw new TypeError(
+                "You're trying to write a non number/non int64 value? "
+                + `(entry ${index} is ${value === null ? "null" : typeof value}: ${String(value)}) `
+                + "-- wrap it in int64(...) instead");
         }
     }
 

