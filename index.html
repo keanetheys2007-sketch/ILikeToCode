@@ -35,6 +35,7 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 .patch-status { margin-top: 10px; padding: 8px 12px; border: 1px solid rgba(79,127,214,0.45); background: rgba(79,127,214,0.12); color: #dfeaff; border-radius: 10px; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.04em; text-align: center; max-width: 720px; width: min(92vw, 720px); }
 .patch-status.warning { border-color: rgba(255,171,0,0.6); background: rgba(255,171,0,0.08); color: #ffd574; }
 .patch-status.ok { border-color: rgba(22,198,12,0.7); background: rgba(22,198,12,0.08); color: #9cf9a5; }
+.version-label { margin-top: 8px; padding: 7px 10px; border: 1px solid rgba(79,127,214,0.35); background: rgba(13,18,30,0.6); color: #dfeaff; border-radius: 8px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-align: center; max-width: 720px; width: min(92vw, 720px); font-family: monospace; }
 .btn-group { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
 .terminal-panel { width: min(720px, 92vw); background: rgba(9, 11, 17, 0.9); border: 1px solid #2a2a35; border-radius: 12px; margin-top: 20px; overflow: hidden; box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
 .terminal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; background: rgba(22, 29, 38, 0.9); border-bottom: 1px solid #2a2a35; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: #8a8a9e; }
@@ -143,12 +144,12 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
 <div id="msg"></div>
 <div id="progress"></div>
 <div id="patch-status" class="patch-status">WebKit patch status: checking…</div>
+<div id="webkit-version-label" class="version-label">WebKit target: waiting for profile…</div>
 <div class="terminal-panel" id="terminal-panel">
     <div class="terminal-header">
         <span>Console</span>
         <div class="terminal-actions">
             <button class="terminal-action" id="copy-log" type="button">Copy</button>
-            <button class="terminal-action" id="save-log" type="button">Save</button>
             <button class="terminal-action" id="clear-log" type="button">Clear</button>
         </div>
     </div>
@@ -238,13 +239,22 @@ const payloadsStatus = document.getElementById("payloads-status");
 const cat = document.getElementById("cat");
 const clearLogBtn = document.getElementById("clear-log");
 const copyLogBtn = document.getElementById("copy-log");
-const saveLogBtn = document.getElementById("save-log");
 const patchStatusEl = document.getElementById("patch-status");
+const webkitVersionLabel = document.getElementById("webkit-version-label");
 
 if (clearLogBtn) {
     clearLogBtn.addEventListener("click", () => {
         if (logEl) logEl.innerHTML = "";
     });
+}
+
+function updateWebkitVersionLabel() {
+    if (!webkitVersionLabel) return;
+
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    const fwText = fw ? `PS5 ${fw}` : "demo profile";
+    webkitVersionLabel.textContent = `WebKit target: ${fwText} • ${stamp}`;
 }
 
 function updatePatchStatus() {
@@ -256,17 +266,20 @@ function updatePatchStatus() {
     if (!fw) {
         patchStatusEl.textContent = "WebKit patch status: browser is not on PS5; demo mode only.";
         patchStatusEl.className = "patch-status warning";
+        updateWebkitVersionLabel();
         return;
     }
 
     if (knownPatch) {
         patchStatusEl.textContent = `WebKit patch status: PS5 ${fwStr} matches a known 13.x WebKit patch profile.`;
         patchStatusEl.className = "patch-status ok";
+        updateWebkitVersionLabel();
         return;
     }
 
     patchStatusEl.textContent = `WebKit patch status: PS5 ${fwStr} looks newer or less common; offset matching may need a fresh profile.`;
     patchStatusEl.className = "patch-status warning";
+    updateWebkitVersionLabel();
 }
 
 async function copyConsoleLog() {
@@ -301,35 +314,7 @@ async function copyConsoleLog() {
     }
 }
 
-async function saveConsoleLogToFile() {
-    if (!logEl || !saveLogBtn) return;
-
-    const text = Array.from(logEl.querySelectorAll(".log-line"))
-        .map(line => line.textContent || "")
-        .join("\n") || "Console log is empty";
-
-    try {
-        const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        const dateStamp = new Date().toISOString().replace(/[:.]/g, "-");
-        link.href = url;
-        link.download = `webkit-console-${dateStamp}.txt`;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
-        saveLogBtn.textContent = "Saved";
-        setTimeout(() => { saveLogBtn.textContent = "Save"; }, 1500);
-    } catch (err) {
-        saveLogBtn.textContent = "Failed";
-        setTimeout(() => { saveLogBtn.textContent = "Save"; }, 2000);
-        msg.textContent = `Unable to save console log: ${err.message}`;
-    }
-}
-
 if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
-if (saveLogBtn) saveLogBtn.addEventListener("click", saveConsoleLogToFile);
 
 const BUILTIN_PAYLOADS = [
     { file: "kstuff.elf", name: "Kstuff (Kernel Exploit)", desc: "Kernel exploit up to 13.60 — fpkg, homebrew, debug", icon: "🔓", color: "#16c60c", port: 9020 },
