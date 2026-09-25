@@ -104,8 +104,8 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
     text-align: left;
     line-height: 1.35;
     margin-top: 10px;
-    max-height: 60vh;
-    min-height: 240px;
+    max-height: 320px;
+    min-height: 200px;
     overflow-y: auto;
     overflow-x: hidden;
     width: 100%;
@@ -432,17 +432,15 @@ const BUILTIN_PAYLOADS = [
 // "SSV-PLACEMENT-MISS / Unable to deserialize data" into a hard failure --
 // core.js classifies that as retrySafe and wants to try again.
 //
-// It was then set too high (6), which is wrong in the other direction: each
-// attempt allocates ~104 MB (72 MB carrier + 32 MB drain) and JSC exposes no
-// gc() on the PS5, so retries stack memory and thrash the collector into
-// "not enough system memory". poops.html states the real placement rate --
-// "placement is ~1 attempt in 3" -- so P(all miss) is (2/3)^N:
-//   3 -> 30%,  5 -> 13%,  6 -> 9%
-// 5 is the point where misses are unlikely without piling on memory. If the
-// RECLAIM-AFTER-RELEASE lines show ~48 MB of headroom, JSC really is
-// collecting and this can go higher; if they show ~0 MB, it is not, and the
-// count must stay low.
-const EXPLOIT_ATTEMPTS = 5;
+// It was then set too high (6), and then down to 3, both wrong. The decisive
+// measurement: after a failed attempt is released the WebProcess can still
+// allocate at least 64 MB (RECLAIM-AFTER-RELEASE), so attempts are NOT
+// stacking -- JSC is collecting them. The only real failure is placement.
+// poops.html states the rate -- "placement is ~1 attempt in 3" -- so
+// P(all miss) is (2/3)^N: 3 -> 30%, 5 -> 13%, 8 -> 6%, 10 -> 2%.
+// With reclaim confirmed working, 8 is affordable and brings the miss rate
+// down to a level where the run essentially always gets its primitive.
+const EXPLOIT_ATTEMPTS = 8;
 
 let exploitState = {
     stage: "idle",

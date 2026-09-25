@@ -363,9 +363,10 @@ function releaseAttemptAllocations() {
     if (typeof globalThis.gc === "function") {
         try { globalThis.gc(); } catch { }
     }
-    const headroom = forceReclaim();
-    emit("RECLAIM-AFTER-RELEASE", `free-after-drop=${(headroom / 1048576).toFixed(1)}MB`
-        + `-attempt=${attemptNumber}`);
+    const { headroom, refused } = forceReclaim();
+    emit("RECLAIM-AFTER-RELEASE",
+        `free=${(headroom / 1048576).toFixed(0)}MB`
+        + `${refused ? "" : "+"}-attempt=${attemptNumber}`);
 }
 
 // JSC exposes no gc() on the PS5, so dropping the references above frees
@@ -380,24 +381,27 @@ function releaseAttemptAllocations() {
 // buffer gives the collector something to reclaim.
 //
 // The headroom it managed to allocate afterwards is the direct measurement we
-// never had: if it is ~48 MB every time, reclaim works and the attempt count
-// can go back up; if it stays near zero, JSC is not collecting the dropped
-// attempt and extra retries are what cause the OOM.
-function forceReclaim(rounds = 8, blockBytes = 256 * 1024, perRound = 32) {
+// never had: if it stops below the cap, JSC really is collecting the dropped
+// attempt and the attempt count can go back up; if it stays pinned at the cap,
+// JSC is not collecting and extra retries are what cause the OOM. The first
+// run of this reported the full 64 MB budget every time, which only proved
+// "at least 64 MB free" -- the budget was the cap, not a refusal, so the cap is
+// now well above what a live attempt needs and the first refusal is the
+// number that matters.
+function forceReclaim(capBytes = 256 * 1024 * 1024, blockBytes = 1024 * 1024) {
     let headroom = 0;
-    for (let i = 0; i < rounds; i++) {
-        const scratch = [];
-        try {
-            for (let j = 0; j < perRound; j++) {
-                scratch.push(new Uint8Array(blockBytes));
-                headroom += blockBytes;
-            }
-        } catch (e) {
-            // Allocation refused -- that is a collection point.
+    let refused = false;
+    const scratch = [];
+    try {
+        while (headroom < capBytes) {
+            scratch.push(new Uint8Array(blockBytes));
+            headroom += blockBytes;
         }
-        scratch.length = 0;
+    } catch (e) {
+        refused = true;              // first refusal is the collection point
     }
-    return headroom;
+    scratch.length = 0;
+    return { headroom, refused, capBytes };
 }
 
 function scheduleSafeRetry(reason) {
