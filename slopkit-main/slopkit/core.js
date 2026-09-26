@@ -13,12 +13,13 @@ const FUNCTION_BYTES = 0x20;
 const NATIVE_EXECUTABLE_BYTES = 0x38;
 const HOLDER_BYTES = 0x40;
 
-// The real memory bug is the hard-coded 9,000,000-slot carrier. That array is
-// large enough to exhaust the WebProcess heap before the primitive is even
-// validated. The correct fix is to keep the carrier small enough to fit inside
-// the browser's stable memory budget instead of trying to brute-force
-// additional retries.
-const CARRIER_SLOTS = 2000000;
+// 9.00 copies 924,176 UTF-16 characters from this backing store (~1.85 MB).
+// This capacity is part of the 9.00 JSC exploit geometry, not merely spare
+// storage. At 9,000,000 slots the corrupted Symbol copy is consistently
+// 924,176 characters. Reducing it to a smaller slot count shortens the
+// backing area and fails the addrof validation because the leak no longer
+// stays covered by its source buffer.
+const CARRIER_SLOTS = 9000000;
 const CARRIER_BYTES = CARRIER_SLOTS * 8;
 const CAPTURE_DELAY_MS = 50;
 const COMPOSE_DELAY_MS = 100;

