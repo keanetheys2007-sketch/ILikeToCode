@@ -427,11 +427,10 @@ const BUILTIN_PAYLOADS = [
     { file: "shadowmountplus.elf", name: "ShadowMount+", desc: "Mount games/backups from USB/network", icon: "💾", color: "#fbbf24", port: 9027 },
 ];
 
-// Fail-fast mode: the PS5 WebProcess hits "not enough system memory space"
-// once the exploit begins reusing its previous heap state. The retry path is
-// therefore disabled for now; the primitive is allowed a single chance to
-// establish itself cleanly instead of burning the browser heap on attempt 2/3.
-const EXPLOIT_ATTEMPTS = 1;
+// The attempt count is not the bug. The actual problem is the oversized
+// carrier graph and the memory churn around it. Retry tuning alone never
+// changes the fact that the JSC object itself is too large for a stable run.
+const EXPLOIT_ATTEMPTS = 8;
 
 let exploitState = {
     stage: "idle",

