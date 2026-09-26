@@ -427,20 +427,11 @@ const BUILTIN_PAYLOADS = [
     { file: "shadowmountplus.elf", name: "ShadowMount+", desc: "Mount games/backups from USB/network", icon: "💾", color: "#fbbf24", port: 9027 },
 ];
 
-// How many times core.js may retry the (inherently probabilistic) SSV
-// placement before giving up. It used to be 1, which turned a routine
-// "SSV-PLACEMENT-MISS / Unable to deserialize data" into a hard failure --
-// core.js classifies that as retrySafe and wants to try again.
-//
-// It was then set too high (6), and then down to 3, both wrong. The decisive
-// measurement: after a failed attempt is released the WebProcess can still
-// allocate at least 64 MB (RECLAIM-AFTER-RELEASE), so attempts are NOT
-// stacking -- JSC is collecting them. The only real failure is placement.
-// poops.html states the rate -- "placement is ~1 attempt in 3" -- so
-// P(all miss) is (2/3)^N: 3 -> 30%, 5 -> 13%, 8 -> 6%, 10 -> 2%.
-// With reclaim confirmed working, 8 is affordable and brings the miss rate
-// down to a level where the run essentially always gets its primitive.
-const EXPLOIT_ATTEMPTS = 8;
+// Fail-fast mode: the PS5 WebProcess hits "not enough system memory space"
+// once the exploit begins reusing its previous heap state. The retry path is
+// therefore disabled for now; the primitive is allowed a single chance to
+// establish itself cleanly instead of burning the browser heap on attempt 2/3.
+const EXPLOIT_ATTEMPTS = 1;
 
 let exploitState = {
     stage: "idle",

@@ -319,6 +319,10 @@ function giveUp(reason) {
 }
 
 function failed() {
+    if (attemptCeiling <= 1) {
+        giveUp("single-attempt-mode");
+        return;
+    }
     if (ceilingReached()) {
         giveUp("attempt-ceiling");
         return;
@@ -1288,7 +1292,7 @@ export function establishPrimitive(options) {
     if (criticalBarrier === defaultCriticalBarrier)
         ensureBarrierNode();
     attemptCeiling = typeof opts.maxAttempts === "number" && opts.maxAttempts > 0
-        ? opts.maxAttempts : 0;
+        ? Math.max(1, opts.maxAttempts) : 1;
 
     running = true;
     stopped = false;
