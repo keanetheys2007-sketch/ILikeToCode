@@ -151,12 +151,21 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
         <span>Console</span>
         <div class="terminal-actions">
             <button class="terminal-action" id="copy-log" type="button">Copy</button>
+            <button class="terminal-action" id="view-log" type="button">View</button>
             <button class="terminal-action" id="download-log" type="button">Download</button>
             <button class="terminal-action" id="email-log" type="button">Email</button>
             <button class="terminal-action" id="clear-log" type="button">Clear</button>
         </div>
     </div>
     <div id="log" aria-live="polite"></div>
+</div>
+
+<div class="modal-overlay" id="log-modal">
+    <div class="modal" style="max-width: 800px;">
+        <h2>Saved Console Log</h2>
+        <textarea id="log-textarea" readonly style="width: 100%; height: 360px; resize: vertical; border-radius: 10px; background: #0b0d13; color: #dfeaff; border: 1px solid #3a3a4d; padding: 12px; font-family: Consolas, monospace; font-size: 12px; box-sizing: border-box;"></textarea>
+        <button class="close-modal" id="close-log-modal">Close</button>
+    </div>
 </div>
 
 <div class="modal-overlay" id="payload-modal">
@@ -339,10 +348,14 @@ const payloadsStatus = document.getElementById("payloads-status");
 const cat = document.getElementById("cat");
 const clearLogBtn = document.getElementById("clear-log");
 const copyLogBtn = document.getElementById("copy-log");
+const viewLogBtn = document.getElementById("view-log");
 const downloadLogBtn = document.getElementById("download-log");
 const emailLogBtn = document.getElementById("email-log");
 const patchStatusEl = document.getElementById("patch-status");
 const webkitVersionLabel = document.getElementById("webkit-version-label");
+const logModal = document.getElementById("log-modal");
+const logTextarea = document.getElementById("log-textarea");
+const closeLogModalBtn = document.getElementById("close-log-modal");
 
 function gatherConsoleText() {
     if (!logEl) return "";
@@ -352,11 +365,30 @@ function gatherConsoleText() {
     return lines.join("\n");
 }
 
+function showLogInModal() {
+    if (!logModal || !logTextarea) return;
+    logTextarea.value = gatherConsoleText() || "Console is empty.";
+    logModal.classList.add("open");
+}
+
+function hideLogModal() {
+    if (logModal) logModal.classList.remove("open");
+}
+
 if (clearLogBtn) {
     clearLogBtn.addEventListener("click", () => {
-        if (logEl) logEl.innerHTML = "";
+        if (logEl) {
+            logEl.innerHTML = "";
+            try { localStorage.removeItem(LOG_STORAGE_KEY); } catch (err) {}
+        }
     });
 }
+
+if (viewLogBtn) viewLogBtn.addEventListener("click", showLogInModal);
+if (closeLogModalBtn) closeLogModalBtn.addEventListener("click", hideLogModal);
+if (logModal) logModal.addEventListener("click", (event) => {
+    if (event.target === logModal) hideLogModal();
+});
 
 async function downloadConsoleLog() {
     const text = gatherConsoleText();
@@ -458,6 +490,7 @@ async function copyConsoleLog() {
 }
 
 if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
+if (viewLogBtn) viewLogBtn.addEventListener("click", showLogInModal);
 if (downloadLogBtn) downloadLogBtn.addEventListener("click", downloadConsoleLog);
 if (emailLogBtn) emailLogBtn.addEventListener("click", emailConsoleLog);
 
