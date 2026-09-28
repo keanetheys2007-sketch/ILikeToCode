@@ -151,6 +151,8 @@ body { user-select:none; -webkit-user-select:none; background: radial-gradient(c
         <span>Console</span>
         <div class="terminal-actions">
             <button class="terminal-action" id="copy-log" type="button">Copy</button>
+            <button class="terminal-action" id="download-log" type="button">Download</button>
+            <button class="terminal-action" id="email-log" type="button">Email</button>
             <button class="terminal-action" id="clear-log" type="button">Clear</button>
         </div>
     </div>
@@ -337,13 +339,57 @@ const payloadsStatus = document.getElementById("payloads-status");
 const cat = document.getElementById("cat");
 const clearLogBtn = document.getElementById("clear-log");
 const copyLogBtn = document.getElementById("copy-log");
+const downloadLogBtn = document.getElementById("download-log");
+const emailLogBtn = document.getElementById("email-log");
 const patchStatusEl = document.getElementById("patch-status");
 const webkitVersionLabel = document.getElementById("webkit-version-label");
+
+function gatherConsoleText() {
+    if (!logEl) return "";
+    return Array.from(logEl.querySelectorAll(".log-line"))
+        .map(line => line.textContent || "")
+        .join("\n");
+}
 
 if (clearLogBtn) {
     clearLogBtn.addEventListener("click", () => {
         if (logEl) logEl.innerHTML = "";
     });
+}
+
+async function downloadConsoleLog() {
+    const text = gatherConsoleText();
+    if (!text) {
+        msg.textContent = "Console is empty.";
+        return;
+    }
+
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ps5-webkit-console-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    msg.textContent = "Console log downloaded as a .log file.";
+}
+
+function emailConsoleLog() {
+    const text = gatherConsoleText();
+    if (!text) {
+        msg.textContent = "Console is empty.";
+        return;
+    }
+
+    const subject = encodeURIComponent("PS5 WebKit console log");
+    const safeText = text.length > 12000 ? text.slice(0, 12000) + "\n\n[truncated]" : text;
+    const body = encodeURIComponent(safeText);
+    const mailto = `mailto:keane.theys2007@gmail.com?subject=${subject}&body=${body}`;
+
+    window.location.href = mailto;
+    msg.textContent = "Your email app should open with the console log attached in the body.";
 }
 
 function updateWebkitVersionLabel() {
@@ -383,9 +429,7 @@ function updatePatchStatus() {
 async function copyConsoleLog() {
     if (!logEl || !copyLogBtn) return;
 
-    const text = Array.from(logEl.querySelectorAll(".log-line"))
-        .map(line => line.textContent || "")
-        .join("\n");
+    const text = gatherConsoleText();
 
     try {
         if (navigator.clipboard && window.isSecureContext) {
@@ -413,6 +457,8 @@ async function copyConsoleLog() {
 }
 
 if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
+if (downloadLogBtn) downloadLogBtn.addEventListener("click", downloadConsoleLog);
+if (emailLogBtn) emailLogBtn.addEventListener("click", emailConsoleLog);
 
 const BUILTIN_PAYLOADS = [
     { file: "kstuff.elf", name: "Kstuff (Kernel Exploit)", desc: "Kernel exploit up to 13.60 — fpkg, homebrew, debug", icon: "🔓", color: "#16c60c", port: 9020 },
