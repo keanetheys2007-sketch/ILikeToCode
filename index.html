@@ -346,9 +346,10 @@ const webkitVersionLabel = document.getElementById("webkit-version-label");
 
 function gatherConsoleText() {
     if (!logEl) return "";
-    return Array.from(logEl.querySelectorAll(".log-line"))
+    const lines = Array.from(logEl.querySelectorAll(".log-line"))
         .map(line => line.textContent || "")
-        .join("\n");
+        .filter(line => line.trim().length > 0);
+    return lines.join("\n");
 }
 
 if (clearLogBtn) {
@@ -460,6 +461,9 @@ if (copyLogBtn) copyLogBtn.addEventListener("click", copyConsoleLog);
 if (downloadLogBtn) downloadLogBtn.addEventListener("click", downloadConsoleLog);
 if (emailLogBtn) emailLogBtn.addEventListener("click", emailConsoleLog);
 
+const LOG_STORAGE_KEY = "ps5_webkit_console_log";
+const MAX_LOG_STORAGE_LINES = 200;
+
 const BUILTIN_PAYLOADS = [
     { file: "kstuff.elf", name: "Kstuff (Kernel Exploit)", desc: "Kernel exploit up to 13.60 — fpkg, homebrew, debug", icon: "🔓", color: "#16c60c", port: 9020 },
     { file: "elfldr-ps5-1360.elf", name: "ELF Loader", desc: "Load custom ELF payloads from USB/host", icon: "📦", color: "#00e5ff", port: 9026 },
@@ -489,14 +493,56 @@ let exploitState = {
     chain: null
 };
 
+function persistConsoleLog() {
+    try {
+        const text = gatherConsoleText();
+        if (!text) return;
+        localStorage.setItem(LOG_STORAGE_KEY, text);
+    } catch (err) {
+        // localStorage can be denied or unavailable while the page is collapsing;
+        // this is best-effort storage so the console is still recoverable.
+    }
+}
+
+function restoreConsoleLog() {
+    if (!logEl) return;
+    try {
+        const saved = localStorage.getItem(LOG_STORAGE_KEY);
+        if (!saved) return;
+
+        const lines = saved.split("\n").filter(Boolean);
+        if (!lines.length) return;
+
+        logEl.innerHTML = "";
+        lines.forEach((line) => {
+            const div = document.createElement("div");
+            div.className = "log-line log-info";
+            div.textContent = line;
+            logEl.appendChild(div);
+        });
+        logEl.scrollTop = logEl.scrollHeight;
+        const restored = document.createElement("div");
+        restored.className = "log-line log-warn";
+        restored.textContent = "[RESTORED] previous console log reloaded from local storage";
+        logEl.appendChild(restored);
+    } catch (err) {
+        // Ignore restore failures; a fresh page should still log normally.
+    }
+}
+
 function log(line, cls = "") {
     const div = document.createElement("div");
     div.className = "log-line " + cls;
-    div.textContent = "[" + new Date().toLocaleTimeString() + "] " + line;
+    const stamp = "[" + new Date().toLocaleTimeString() + "] " + line;
+    div.textContent = stamp;
     logEl.appendChild(div);
     logEl.scrollTop = logEl.scrollHeight;
-    if (logEl.children.length > 100) logEl.removeChild(logEl.firstChild);
+    if (logEl.children.length > MAX_LOG_STORAGE_LINES) logEl.removeChild(logEl.firstChild);
+    persistConsoleLog();
 }
+
+window.addEventListener("beforeunload", persistConsoleLog);
+if (logEl) restoreConsoleLog();
 
 function updateStageBadge(stage) {
     const stages = {
